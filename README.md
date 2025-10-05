@@ -114,11 +114,30 @@ This application consists of two main components:
 
 2. **Python MCP Server** (`whatsapp-mcp-server/`): A Python server implementing the Model Context Protocol (MCP), which provides standardized tools for Claude to interact with WhatsApp data and send/receive messages.
 
+### Database Configuration
+
+The application supports both SQLite and PostgreSQL as database backends. By default, it uses SQLite, which requires no additional configuration.
+
+To use PostgreSQL, you need to set the following environment variables before running the `whatsapp-bridge`:
+
+- `DB_DRIVER`: Set this to `postgres` to use the PostgreSQL driver.
+- `DATABASE_URL`: Provide the connection string for your PostgreSQL database.
+
+Example of running with PostgreSQL:
+
+```bash
+export DB_DRIVER=postgres
+export DATABASE_URL="postgres://user:password@host:port/dbname?sslmode=disable"
+cd whatsapp-bridge
+go run main.go
+```
+
 ### Data Storage
 
-- All message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory
-- The database maintains tables for chats and messages
-- Messages are indexed for efficient searching and retrieval
+- By default, all message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory.
+- The application also supports PostgreSQL for more robust data storage needs.
+- The database maintains tables for chats and messages.
+- Messages are indexed for efficient searching and retrieval.
 
 ## Usage
 
