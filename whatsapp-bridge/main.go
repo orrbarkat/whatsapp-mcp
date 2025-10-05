@@ -42,10 +42,34 @@ type Message struct {
 	Filename  string
 }
 
-// Database handler for storing message history
+// Database is the interface for database operations
+type Database interface {
+	Init() error
+	StoreChat(jid, name string, lastMessageTime time.Time) error
+	StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
+		mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error
+	GetMessages(chatJID string, limit int) ([]Message, error)
+	GetChats() (map[string]time.Time, error)
+	StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error
+	GetMediaInfo(id, chatJID string) (string, string, string, []byte, []byte, []byte, uint64, error)
+	GetChatName(chatID string) (string, error)
+	GetMessageMediaTypeAndFilename(messageID, chatJID string) (string, string, error)
+	Close() error
+}
+
+// SQLiteDB implements the Database interface for SQLite
+type SQLiteDB struct {
+	db *sql.DB
+}
+
+// PostgresDB implements the Database interface for PostgreSQL
+type PostgresDB struct {
+	db *sql.DB
+}
+
+// MessageStore now uses the Database interface
 type MessageStore struct {
-	db     *sql.DB
-	driver string
+	db Database
 }
 
 // DBConfig holds database configuration
@@ -85,72 +109,84 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, err
 	}
 
-	// Open database connection
 	db, err := sql.Open(config.driver, config.dataSourceName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
 
-	// Create tables if they don't exist
+	var database Database
 	if config.driver == "postgres" {
-		_, err = db.Exec(`
-			CREATE TABLE IF NOT EXISTS chats (
-				jid TEXT PRIMARY KEY,
-				name TEXT,
-				last_message_time TIMESTAMP
-			);
-
-			CREATE TABLE IF NOT EXISTS messages (
-				id TEXT,
-				chat_jid TEXT,
-				sender TEXT,
-				content TEXT,
-				timestamp TIMESTAMP,
-				is_from_me BOOLEAN,
-				media_type TEXT,
-				filename TEXT,
-				url TEXT,
-				media_key BYTEA,
-				file_sha256 BYTEA,
-				file_enc_sha256 BYTEA,
-				file_length BIGINT,
-				PRIMARY KEY (id, chat_jid),
-				FOREIGN KEY (chat_jid) REFERENCES chats(jid)
-			);
-		`)
+		database = &PostgresDB{db: db}
 	} else {
-		_, err = db.Exec(`
-			CREATE TABLE IF NOT EXISTS chats (
-				jid TEXT PRIMARY KEY,
-				name TEXT,
-				last_message_time TIMESTAMP
-			);
-
-			CREATE TABLE IF NOT EXISTS messages (
-				id TEXT,
-				chat_jid TEXT,
-				sender TEXT,
-				content TEXT,
-				timestamp TIMESTAMP,
-				is_from_me BOOLEAN,
-				media_type TEXT,
-				filename TEXT,
-				url TEXT,
-				media_key BLOB,
-				file_sha256 BLOB,
-				file_enc_sha256 BLOB,
-				file_length INTEGER,
-				PRIMARY KEY (id, chat_jid),
-				FOREIGN KEY (chat_jid) REFERENCES chats(jid)
-			);
-		`)
-	}
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to create tables: %v", err)
+		database = &SQLiteDB{db: db}
 	}
 
-	return &MessageStore{db: db, driver: config.driver}, nil
+	if err := database.Init(); err != nil {
+		database.Close()
+		return nil, fmt.Errorf("failed to initialize database: %v", err)
+	}
+
+	return &MessageStore{db: database}, nil
+}
+
+// Init creates tables for SQLite
+func (s *SQLiteDB) Init() error {
+	_, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS chats (
+			jid TEXT PRIMARY KEY,
+			name TEXT,
+			last_message_time TIMESTAMP
+		);
+
+		CREATE TABLE IF NOT EXISTS messages (
+			id TEXT,
+			chat_jid TEXT,
+			sender TEXT,
+			content TEXT,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			media_type TEXT,
+			filename TEXT,
+			url TEXT,
+			media_key BLOB,
+			file_sha256 BLOB,
+			file_enc_sha256 BLOB,
+			file_length INTEGER,
+			PRIMARY KEY (id, chat_jid),
+			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+	`)
+	return err
+}
+
+// Init creates tables for PostgreSQL
+func (p *PostgresDB) Init() error {
+	_, err := p.db.Exec(`
+		CREATE TABLE IF NOT EXISTS chats (
+			jid TEXT PRIMARY KEY,
+			name TEXT,
+			last_message_time TIMESTAMP
+		);
+
+		CREATE TABLE IF NOT EXISTS messages (
+			id TEXT,
+			chat_jid TEXT,
+			sender TEXT,
+			content TEXT,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			media_type TEXT,
+			filename TEXT,
+			url TEXT,
+			media_key BYTEA,
+			file_sha256 BYTEA,
+			file_enc_sha256 BYTEA,
+			file_length BIGINT,
+			PRIMARY KEY (id, chat_jid),
+			FOREIGN KEY (chat_jid) REFERENCES chats(jid) ON DELETE CASCADE
+		);
+	`)
+	return err
 }
 
 // Close the database connection
@@ -158,80 +194,113 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
-// Rebind query to use correct placeholder for the driver
-func (store *MessageStore) Rebind(query string) string {
-	if store.driver == "postgres" {
-		// Replace question marks with numbered placeholders
-		parts := strings.Split(query, "?")
-		var b strings.Builder
-		for i := 0; i < len(parts)-1; i++ {
-			b.WriteString(parts[i])
-			b.WriteString(fmt.Sprintf("$%d", i+1))
-		}
-		b.WriteString(parts[len(parts)-1])
-		return b.String()
-	}
-	// sqlite3 uses question marks
-	return query
+// Close closes the database connection
+func (s *SQLiteDB) Close() error {
+	return s.db.Close()
+}
+
+// Close closes the database connection
+func (p *PostgresDB) Close() error {
+	return p.db.Close()
 }
 
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
-	var query string
-	if store.driver == "postgres" {
-		query = `
-			INSERT INTO chats (jid, name, last_message_time)
-			VALUES (?, ?, ?)
-			ON CONFLICT (jid) DO UPDATE SET
-				name = EXCLUDED.name,
-				last_message_time = EXCLUDED.last_message_time
-		`
-	} else {
-		query = "INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)"
-	}
-	_, err := store.db.Exec(store.Rebind(query), jid, name, lastMessageTime)
+	return store.db.StoreChat(jid, name, lastMessageTime)
+}
+
+func (s *SQLiteDB) StoreChat(jid, name string, lastMessageTime time.Time) error {
+	query := "INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)"
+	_, err := s.db.Exec(query, jid, name, lastMessageTime)
+	return err
+}
+
+func (p *PostgresDB) StoreChat(jid, name string, lastMessageTime time.Time) error {
+	query := `
+		INSERT INTO chats (jid, name, last_message_time)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (jid) DO UPDATE SET
+			name = EXCLUDED.name,
+			last_message_time = EXCLUDED.last_message_time
+	`
+	_, err := p.db.Exec(query, jid, name, lastMessageTime)
 	return err
 }
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
-	// Only store if there's actual content or media
+	return store.db.StoreMessage(id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+}
+
+func (s *SQLiteDB) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	if content == "" && mediaType == "" {
 		return nil
 	}
+	query := `INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := s.db.Exec(query, id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+	return err
+}
 
-	var query string
-	if store.driver == "postgres" {
-		query = `
-			INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (id, chat_jid) DO UPDATE SET
-				sender = EXCLUDED.sender,
-				content = EXCLUDED.content,
-				timestamp = EXCLUDED.timestamp,
-				is_from_me = EXCLUDED.is_from_me,
-				media_type = EXCLUDED.media_type,
-				filename = EXCLUDED.filename,
-				url = EXCLUDED.url,
-				media_key = EXCLUDED.media_key,
-				file_sha256 = EXCLUDED.file_sha256,
-				file_enc_sha256 = EXCLUDED.file_enc_sha256,
-				file_length = EXCLUDED.file_length
-		`
-	} else {
-		query = `INSERT OR REPLACE INTO messages
-			(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+func (p *PostgresDB) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	if content == "" && mediaType == "" {
+		return nil
 	}
-	_, err := store.db.Exec(store.Rebind(query), id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+	query := `
+		INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		ON CONFLICT (id, chat_jid) DO UPDATE SET
+			sender = EXCLUDED.sender,
+			content = EXCLUDED.content,
+			timestamp = EXCLUDED.timestamp,
+			is_from_me = EXCLUDED.is_from_me,
+			media_type = EXCLUDED.media_type,
+			filename = EXCLUDED.filename,
+			url = EXCLUDED.url,
+			media_key = EXCLUDED.media_key,
+			file_sha256 = EXCLUDED.file_sha256,
+			file_enc_sha256 = EXCLUDED.file_enc_sha256,
+			file_length = EXCLUDED.file_length
+	`
+	_, err := p.db.Exec(query, id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
 	return err
 }
 
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
-	query := store.Rebind("SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?")
-	rows, err := store.db.Query(query, chatJID, limit)
+	return store.db.GetMessages(chatJID, limit)
+}
+
+func (s *SQLiteDB) GetMessages(chatJID string, limit int) ([]Message, error) {
+	query := "SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?"
+	rows, err := s.db.Query(query, chatJID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []Message
+	for rows.Next() {
+		var msg Message
+		var timestamp time.Time
+		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
+		if err != nil {
+			return nil, err
+		}
+		msg.Time = timestamp
+		messages = append(messages, msg)
+	}
+
+	return messages, nil
+}
+
+func (p *PostgresDB) GetMessages(chatJID string, limit int) ([]Message, error) {
+	query := "SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = $1 ORDER BY timestamp DESC LIMIT $2"
+	rows, err := p.db.Query(query, chatJID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -254,8 +323,32 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 
 // Get all chats
 func (store *MessageStore) GetChats() (map[string]time.Time, error) {
-	query := store.Rebind("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
-	rows, err := store.db.Query(query)
+	return store.db.GetChats()
+}
+
+func (s *SQLiteDB) GetChats() (map[string]time.Time, error) {
+	rows, err := s.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	chats := make(map[string]time.Time)
+	for rows.Next() {
+		var jid string
+		var lastMessageTime time.Time
+		err := rows.Scan(&jid, &lastMessageTime)
+		if err != nil {
+			return nil, err
+		}
+		chats[jid] = lastMessageTime
+	}
+
+	return chats, nil
+}
+
+func (p *PostgresDB) GetChats() (map[string]time.Time, error) {
+	rows, err := p.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -589,29 +682,74 @@ type DownloadMediaResponse struct {
 
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
-	var query string
-	if store.driver == "postgres" {
-		query = `
-			UPDATE messages
-			SET url = ?, media_key = ?, file_sha256 = ?, file_enc_sha256 = ?, file_length = ?
-			WHERE id = ? AND chat_jid = ?`
-	} else {
-		query = "UPDATE messages SET url = ?, media_key = ?, file_sha256 = ?, file_enc_sha256 = ?, file_length = ? WHERE id = ? AND chat_jid = ?"
-	}
-	_, err := store.db.Exec(store.Rebind(query), url, mediaKey, fileSHA256, fileEncSHA256, fileLength, id, chatJID)
+	return store.db.StoreMediaInfo(id, chatJID, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+}
+
+func (s *SQLiteDB) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	query := "UPDATE messages SET url = ?, media_key = ?, file_sha256 = ?, file_enc_sha256 = ?, file_length = ? WHERE id = ? AND chat_jid = ?"
+	_, err := s.db.Exec(query, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, id, chatJID)
+	return err
+}
+
+func (p *PostgresDB) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	query := "UPDATE messages SET url = $1, media_key = $2, file_sha256 = $3, file_enc_sha256 = $4, file_length = $5 WHERE id = $6 AND chat_jid = $7"
+	_, err := p.db.Exec(query, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, id, chatJID)
 	return err
 }
 
 // Get media info from the database
 func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, string, []byte, []byte, []byte, uint64, error) {
+	return store.db.GetMediaInfo(id, chatJID)
+}
+
+func (s *SQLiteDB) GetMediaInfo(id, chatJID string) (string, string, string, []byte, []byte, []byte, uint64, error) {
 	var mediaType, filename, url string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
 	var fileLength uint64
 
-	query := store.Rebind("SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ?")
-	err := store.db.QueryRow(query, id, chatJID).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
+	query := "SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ?"
+	err := s.db.QueryRow(query, id, chatJID).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
 
 	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
+}
+
+func (p *PostgresDB) GetMediaInfo(id, chatJID string) (string, string, string, []byte, []byte, []byte, uint64, error) {
+	var mediaType, filename, url string
+	var mediaKey, fileSHA256, fileEncSHA256 []byte
+	var fileLength uint64
+
+	query := "SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = $1 AND chat_jid = $2"
+	err := p.db.QueryRow(query, id, chatJID).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
+
+	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
+}
+
+func (s *SQLiteDB) GetChatName(chatID string) (string, error) {
+	var existingName string
+	query := "SELECT name FROM chats WHERE jid = ?"
+	err := s.db.QueryRow(query, chatID).Scan(&existingName)
+	return existingName, err
+}
+
+func (p *PostgresDB) GetChatName(chatID string) (string, error) {
+	var existingName string
+	query := "SELECT name FROM chats WHERE jid = $1"
+	err := p.db.QueryRow(query, chatID).Scan(&existingName)
+	return existingName, err
+}
+
+func (s *SQLiteDB) GetMessageMediaTypeAndFilename(messageID, chatJID string) (string, string, error) {
+	var mediaType, filename string
+	query := "SELECT media_type, filename FROM messages WHERE id = ? AND chat_jid = ?"
+	err := s.db.QueryRow(query, messageID, chatJID).Scan(&mediaType, &filename)
+	return mediaType, filename, err
+}
+
+func (p *PostgresDB) GetMessageMediaTypeAndFilename(messageID, chatJID string) (string, string, error) {
+	var mediaType, filename string
+	query := "SELECT media_type, filename FROM messages WHERE id = $1 AND chat_jid = $2"
+	err := p.db.QueryRow(query, messageID, chatJID).Scan(&mediaType, &filename)
+	return mediaType, filename, err
 }
 
 // MediaDownloader implements the whatsmeow.DownloadableMessage interface
@@ -677,9 +815,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	if err != nil {
 		// Try to get basic info if extended info isn't available
-		query := messageStore.Rebind("SELECT media_type, filename FROM messages WHERE id = ? AND chat_jid = ?")
-		err = messageStore.db.QueryRow(query, messageID, chatJID).Scan(&mediaType, &filename)
-
+		mediaType, filename, err = messageStore.db.GetMessageMediaTypeAndFilename(messageID, chatJID)
 		if err != nil {
 			return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
 		}
@@ -1039,9 +1175,7 @@ func main() {
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
-	var existingName string
-	query := messageStore.Rebind("SELECT name FROM chats WHERE jid = ?")
-	err := messageStore.db.QueryRow(query, chatJID).Scan(&existingName)
+	existingName, err := messageStore.db.GetChatName(chatJID)
 	if err == nil && existingName != "" {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
