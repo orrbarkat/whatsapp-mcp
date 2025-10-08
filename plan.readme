@@ -1,0 +1,102 @@
+# Cloud Run enablement plan
+
+Objective
+- Deploy two Cloud Run services:
+  - whatsapp-bridge (Go): REST API on :8080 (use PORT env), talks to WhatsApp via whatsmeow, persists to local SQLite (ephemeral in Cloud Run initially).
+  - whatsapp-mcp-server (Python): add optional HTTP transport while preserving stdio; in HTTP mode, expose MCP tool endpoints and call the bridge via authenticated requests.
+- Security: Require Cloud Run IAM (authenticated invokers). Service-to-service auth from MCP → bridge via ID token.
+- Performance/Cost: Region near Israel (default me-west1), min instances=1 (keep WhatsApp session warm), low CPU/memory. Include ffmpeg in MCP image.
+- Local dev remains intact (stdio MCP; local bridge on :8080).
+
+Scope decisions (confirmed)
+1) Topology: Separate Cloud Run services for Go bridge and Python MCP.
+2) MCP transport: Add HTTP endpoints behind a flag/env; default remains stdio.
+3) WhatsApp auth: Pre-provision locally (QR scan) for now; later add QR surfacing endpoint as a future improvement.
+4) Storage: Accept ephemeral storage now; plan future persistence (Cloud SQL or GCS FUSE) as a follow-up.
+5) Cloud Run settings: project whatsapp-465919, region me-west1, authenticated access, min instances=1, low CPU/memory, ffmpeg included.
+6) Delivery workflow: Use a local deploy script; add CI/CD as a future improvement. Branch name: feat/cloudrun-dual-services.
+
+Deliverables
+1) Code changes
+- Go (whatsapp-bridge):
+  - Read PORT from env with fallback to 8080; pass to startRESTServer.
+  - Keep current SQLite store path (./whatsapp-bridge/store/). Accept ephemeral storage in Cloud Run.
+- Python (whatsapp-mcp-server):
+  - Transport selection via flag/env: stdio (default) or http.
+  - HTTP mode: FastAPI app with endpoints for all current MCP tools (search_contacts, list_messages, list_chats, get_chat, get_direct_chat_by_contact, get_contact_chats, get_last_interaction, get_message_context, send_message, send_file, send_audio_message, download_media).
+  - Configurable bridge URL via WHATSAPP_API_BASE_URL (default http://localhost:8080/api).
+  - Service-to-service auth: if BRIDGE_AUDIENCE is set, obtain ID token and set Authorization: Bearer <token> in requests to the bridge; otherwise unauthenticated (local).
+  - Dependencies: fastapi, uvicorn[standard], google-auth (added to pyproject).
+
+2) Containers
+- whatsapp-bridge/Dockerfile
+  - Multi-stage build with golang to compile static-ish binary (CGO enabled for go-sqlite3); run on a minimal Debian/Distroless base with needed libs.
+  - Include (optionally) pre-provisioned whatsapp-bridge/store/ for initial auth.
+  - Expose $PORT and honor PORT at runtime.
+- whatsapp-mcp-server/Dockerfile
+  - python:3.12-slim base.
+  - Install ffmpeg via apt.
+  - Install project deps (uv or pip), including FastAPI/uvicorn/google-auth.
+  - In HTTP mode: run uvicorn main:app --host 0.0.0.0 --port $PORT.
+  - In stdio mode: keep current entrypoint for local dev.
+
+3) Deployment script (scripts/deploy-cloudrun.sh)
+- Defaults: PROJECT_ID=whatsapp-465919, REGION=me-west1, BRIDGE_SVC=whatsapp-bridge, MCP_SVC=whatsapp-mcp.
+- Steps:
+  - gcloud config set project $PROJECT_ID
+  - Build & push images (gcloud builds submit or docker build/push + gcloud run deploy).
+  - Deploy bridge:
+    - --no-allow-unauthenticated, --min-instances=1, low CPU/memory.
+  - Capture bridge URL (BRIDGE_URL).
+  - Deploy MCP:
+    - --no-allow-unauthenticated, --min-instances=1, low CPU/memory.
+    - --set-env-vars WHATSAPP_API_BASE_URL=https://$BRIDGE_URL/api,BRIDGE_AUDIENCE=https://$BRIDGE_URL,TRANSPORT_MODE=http
+  - IAM: ensure MCP service account has roles/run.invoker on bridge.
+
+4) Documentation
+- CLOUDRUN_PENDING.md for deferred enhancements:
+  - QR surfacing endpoint in bridge (ASCII/PNG QR over HTTP) for remote pair.
+  - Persistence options (Cloud SQL migration preferred; GCS FUSE caveats with SQLite).
+  - CI/CD (GitHub Actions), Artifact Registry caching, environment promotion.
+  - Observability (structured logs, error reporting, uptime checks), security hardening.
+  - Region/cost verification.
+
+Acceptance criteria
+- Local:
+  - StdIO MCP remains functional (uv run --directory whatsapp-mcp-server main.py).
+  - HTTP MCP mode available locally with a flag/env; responds on configured port.
+- Cloud Run:
+  - Bridge and MCP deployed in me-west1; both require IAM authentication.
+  - MCP calls to bridge succeed with ID token auth when BRIDGE_AUDIENCE is provided.
+  - ffmpeg present in MCP container; send_audio_message converts non-.ogg.
+- Deployment script:
+  - End-to-end deploys both services and sets required env vars.
+
+Testing strategy (use tests generously)
+- Go unit tests (fast, hermetic):
+  - Test extractDirectPathFromURL strips querystring and returns a direct path.
+  - Test placeholderWaveform properties (length=64; values within 0..100).
+- Python unit tests (pytest):
+  - Test format_message with is_from_me=True (no DB access).
+  - Test media prefix formatting for messages with media_type.
+  - Test format_messages_list empty behavior.
+- HTTP transport tests (to add after implementation):
+  - Spin up FastAPI app with TestClient; validate each endpoint shape and response type.
+  - Mock bridge calls for send/download paths; unit-test ID token injection when BRIDGE_AUDIENCE is set.
+- Integration tests (later):
+  - Optional local docker-compose bringing up both services; verify MCP HTTP calls the bridge REST.
+
+Task breakdown
+1) Wire PORT env in Go and refactor startRESTServer caller.
+2) Add HTTP mode to Python MCP (FastAPI + endpoints) behind --transport=http and TRANSPORT_MODE.
+3) Env-ify WHATSAPP_API_BASE_URL and implement optional ID token auth.
+4) Add the tests listed above (Go + Python) and ensure they pass locally for current scope.
+5) Create Dockerfiles for both services (with ffmpeg in MCP).
+6) Write scripts/deploy-cloudrun.sh to build, deploy, set IAM and envs.
+7) Add CLOUDRUN_PENDING.md capturing QR surfacing, persistence, CI/CD, observability, security.
+8) Update README minimally to point to Cloud Run usage (or link to this plan and pending doc).
+
+Notes
+- Initial Cloud Run deployments will lose state on redeploy/scale-to-zero. Pre-provision locally and consider bundling initial store/ for convenience.
+- Enabling unauthenticated access is explicitly avoided; all invocations go through IAM.
+- Region default: me-west1 (Tel Aviv). Override via REGION if needed.
