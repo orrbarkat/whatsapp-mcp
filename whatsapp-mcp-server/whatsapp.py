@@ -2,13 +2,34 @@ import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+import os
 import os.path
 import requests
 import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = os.getenv("WHATSAPP_API_BASE_URL", "http://localhost:8080/api")
+
+
+def _auth_headers() -> dict:
+    """Return Authorization headers for service-to-service calls if BRIDGE_AUDIENCE is set.
+    In Cloud Run, this uses the ambient service account to mint an ID token.
+    """
+    audience = os.getenv("BRIDGE_AUDIENCE")
+    if not audience:
+        return {}
+    try:
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+        from google.oauth2 import id_token
+        import google.auth
+        # Use default credentials (works in Cloud Run)
+        _creds, _ = google.auth.default()
+        token = id_token.fetch_id_token(GoogleAuthRequest(), audience)
+        return {"Authorization": f"Bearer {token}"}
+    except Exception:
+        # Fall back silently to no auth header if token minting fails
+        return {}
 
 @dataclass
 class Message:
@@ -634,7 +655,7 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             "message": message,
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_auth_headers())
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -668,7 +689,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_auth_headers())
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -708,7 +729,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_auth_headers())
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -741,7 +762,7 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_auth_headers())
         
         if response.status_code == 200:
             result = response.json()

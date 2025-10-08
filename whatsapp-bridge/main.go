@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -677,6 +678,12 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Healthcheck endpoint
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -905,8 +912,8 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server (honor PORT env for Cloud Run)
+	startRESTServer(client, messageStore, getServerPort())
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -920,6 +927,19 @@ func main() {
 	fmt.Println("Disconnecting...")
 	// Disconnect client
 	client.Disconnect()
+}
+
+// getServerPort reads the PORT environment variable (Cloud Run) or returns 8080
+func getServerPort() int {
+	portStr := os.Getenv("PORT")
+	if portStr == "" {
+		return 8080
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil || p <= 0 || p >= 65536 {
+		return 8080
+	}
+	return p
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info

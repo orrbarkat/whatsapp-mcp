@@ -1,4 +1,6 @@
 from typing import List, Dict, Any, Optional
+import os
+import argparse
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -15,8 +17,147 @@ from whatsapp import (
     download_media as whatsapp_download_media
 )
 
+try:
+    from fastapi import FastAPI
+    from pydantic import BaseModel
+except Exception:
+    FastAPI = None  # type: ignore
+    BaseModel = object  # type: ignore
+
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
+
+# -------- HTTP transport (optional) --------
+class _SearchContactsReq(BaseModel):
+    query: str
+
+class _ListMessagesReq(BaseModel):
+    after: Optional[str] = None
+    before: Optional[str] = None
+    sender_phone_number: Optional[str] = None
+    chat_jid: Optional[str] = None
+    query: Optional[str] = None
+    limit: int = 20
+    page: int = 0
+    include_context: bool = True
+    context_before: int = 1
+    context_after: int = 1
+
+class _ListChatsReq(BaseModel):
+    query: Optional[str] = None
+    limit: int = 20
+    page: int = 0
+    include_last_message: bool = True
+    sort_by: str = "last_active"
+
+class _GetChatReq(BaseModel):
+    chat_jid: str
+    include_last_message: bool = True
+
+class _GetDirectChatReq(BaseModel):
+    sender_phone_number: str
+
+class _GetContactChatsReq(BaseModel):
+    jid: str
+    limit: int = 20
+    page: int = 0
+
+class _GetLastInteractionReq(BaseModel):
+    jid: str
+
+class _GetMessageContextReq(BaseModel):
+    message_id: str
+    before: int = 5
+    after: int = 5
+
+class _SendMessageReq(BaseModel):
+    recipient: str
+    message: str
+
+class _SendFileReq(BaseModel):
+    recipient: str
+    media_path: str
+
+class _DownloadMediaReq(BaseModel):
+    message_id: str
+    chat_jid: str
+
+
+def create_app():
+    if FastAPI is None:
+        raise RuntimeError("FastAPI is not installed; install extras to enable HTTP transport")
+    app = FastAPI()
+
+    @app.post("/search_contacts")
+    def http_search_contacts(req: _SearchContactsReq):
+        return search_contacts(req.query)
+
+    @app.post("/list_messages")
+    def http_list_messages(req: _ListMessagesReq):
+        return list_messages(
+            after=req.after,
+            before=req.before,
+            sender_phone_number=req.sender_phone_number,
+            chat_jid=req.chat_jid,
+            query=req.query,
+            limit=req.limit,
+            page=req.page,
+            include_context=req.include_context,
+            context_before=req.context_before,
+            context_after=req.context_after,
+        )
+
+    @app.post("/list_chats")
+    def http_list_chats(req: _ListChatsReq):
+        return list_chats(
+            query=req.query,
+            limit=req.limit,
+            page=req.page,
+            include_last_message=req.include_last_message,
+            sort_by=req.sort_by,
+        )
+
+    @app.post("/get_chat")
+    def http_get_chat(req: _GetChatReq):
+        return get_chat(req.chat_jid, req.include_last_message)
+
+    @app.post("/get_direct_chat_by_contact")
+    def http_get_direct_chat_by_contact(req: _GetDirectChatReq):
+        return get_direct_chat_by_contact(req.sender_phone_number)
+
+    @app.post("/get_contact_chats")
+    def http_get_contact_chats(req: _GetContactChatsReq):
+        return get_contact_chats(req.jid, req.limit, req.page)
+
+    @app.post("/get_last_interaction")
+    def http_get_last_interaction(req: _GetLastInteractionReq):
+        return get_last_interaction(req.jid)
+
+    @app.post("/get_message_context")
+    def http_get_message_context(req: _GetMessageContextReq):
+        return get_message_context(req.message_id, req.before, req.after)
+
+    @app.post("/send_message")
+    def http_send_message(req: _SendMessageReq):
+        return send_message(req.recipient, req.message)
+
+    @app.post("/send_file")
+    def http_send_file(req: _SendFileReq):
+        return send_file(req.recipient, req.media_path)
+
+    @app.post("/send_audio_message")
+    def http_send_audio_message(req: _SendFileReq):
+        return send_audio_message(req.recipient, req.media_path)
+
+    @app.post("/download_media")
+    def http_download_media(req: _DownloadMediaReq):
+        return download_media(req.message_id, req.chat_jid)
+
+    @app.get("/healthz")
+    def healthz():
+        return {"status": "ok"}
+
+    return app
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -247,5 +388,16 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
         }
 
 if __name__ == "__main__":
-    # Initialize and run the server
-    mcp.run(transport='stdio')
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--transport", choices=["stdio", "http"], default=os.getenv("TRANSPORT_MODE", "stdio"))
+    args = parser.parse_args()
+
+    if args.transport == "http":
+        if FastAPI is None:
+            raise RuntimeError("FastAPI is not installed; cannot run HTTP transport. Install fastapi/uvicorn.")
+        app = create_app()
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    else:
+        # Initialize and run the server in stdio mode (default)
+        mcp.run(transport='stdio')

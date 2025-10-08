@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestExtractDirectPathFromURL(t *testing.T) {
 	url := "https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=abc"
@@ -25,5 +28,23 @@ func TestPlaceholderWaveform_LengthAndRange(t *testing.T) {
 		if v > 100 { // v is unsigned, only need upper bound
 			t.Fatalf("waveform[%d]=%d out of range [0,100]", i, v)
 		}
+	}
+}
+
+func TestGetServerPort_FromEnv(t *testing.T) {
+	old := os.Getenv("PORT")
+	t.Cleanup(func() { _ = os.Setenv("PORT", old) })
+	_ = os.Setenv("PORT", "9090")
+	if p := getServerPort(); p != 9090 {
+		t.Fatalf("expected 9090, got %d", p)
+	}
+}
+
+func TestGetServerPort_Default(t *testing.T) {
+	old := os.Getenv("PORT")
+	t.Cleanup(func() { _ = os.Setenv("PORT", old) })
+	_ = os.Unsetenv("PORT")
+	if p := getServerPort(); p != 8080 {
+		t.Fatalf("expected default 8080, got %d", p)
 	}
 }
