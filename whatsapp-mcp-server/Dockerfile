@@ -22,4 +22,4 @@ ENV PORT=8080
 EXPOSE 8080
 
 # Health checks can use /healthz
-CMD ["python", "main.py", "--transport=http"]
+CMD ["python", "server.py", "--transport=http"]

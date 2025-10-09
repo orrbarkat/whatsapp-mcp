@@ -9,7 +9,7 @@ except Exception:  # pragma: no cover
 
 @pytest.mark.skipif(not fastapi_available, reason="fastapi not installed")
 def test_search_contacts_endpoint(monkeypatch):
-    import whatsapp_mcp_server.main as m
+    import server as m
 
     # monkeypatch the underlying function to avoid DB access
     monkeypatch.setattr(m, "search_contacts", lambda query: [{"jid": "1", "name": "Alice"}])
