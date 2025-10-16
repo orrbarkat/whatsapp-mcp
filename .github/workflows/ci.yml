@@ -29,7 +29,7 @@ jobs:
       run: |
         cd whatsapp-mcp-server
         uv run ruff check .
-    - name's type checking with mypy
+    - name: type checking with mypy
       run: |
         cd whatsapp-mcp-server
         uv run mypy .
