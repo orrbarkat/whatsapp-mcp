@@ -16,7 +16,7 @@ import signal
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 BRIDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge')
-BRIDGE_EXECUTABLE = "main.go"
+BRIDGE_EXECUTABLE = "whatsapp-bridge"
 BRIDGE_PROCESS = None
 BRIDGE_OUTPUT_QUEUE = queue.Queue()
 QR_CODE_DATA = None
@@ -149,14 +149,11 @@ def is_bridge_process_running() -> bool:
     if BRIDGE_PROCESS and BRIDGE_PROCESS.poll() is None:
         return True
     
-    # Check if any go process is running main.go in the bridge directory
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+    # Check if any process is running the bridge executable
+    for proc in psutil.process_iter(['pid', 'name', 'exe']):
         try:
-            if proc.info['name'] in ['go', 'main']:
-                cmdline = proc.info['cmdline']
-                if cmdline and any('main.go' in arg for arg in cmdline):
-                    if any(BRIDGE_DIR in arg for arg in cmdline):
-                        return True
+            if proc.info['exe'] and 'whatsapp-bridge' in proc.info['exe']:
+                return True
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     
@@ -240,39 +237,21 @@ def start_bridge_process() -> Tuple[bool, str]:
         if not os.path.exists(bridge_path):
             return False, f"Bridge directory not found: {bridge_path}"
         
-        go_file = os.path.join(bridge_path, BRIDGE_EXECUTABLE)
-        if not os.path.exists(go_file):
-            return False, f"Bridge executable not found: {go_file}"
+        executable_path = os.path.join(bridge_path, BRIDGE_EXECUTABLE)
+        if not os.path.exists(executable_path):
+            return False, f"Bridge executable not found: {executable_path}"
         
-        # Find Go executable
-        go_cmd = None
-        for go_path in ['/usr/local/go/bin/go', '/opt/homebrew/bin/go', 'go']:
-            try:
-                result = subprocess.run([go_path, 'version'], capture_output=True, timeout=5)
-                if result.returncode == 0:
-                    go_cmd = go_path
-                    break
-            except (subprocess.SubprocessError, FileNotFoundError):
-                continue
-        
-        if not go_cmd:
-            return False, "Go executable not found. Please ensure Go is installed and accessible."
-        
-        # Prepare environment with Go paths
-        env = os.environ.copy()
-        env['PATH'] = '/usr/local/go/bin:/opt/homebrew/bin:' + env.get('PATH', '')
-        env['GOPATH'] = env.get('GOPATH', os.path.expanduser('~/go'))
-        env['GOROOT'] = env.get('GOROOT', '/usr/local/go')
-        
+        # Make sure the binary is executable
+        os.chmod(executable_path, 0o755)
+
         # Start the process
         BRIDGE_PROCESS = subprocess.Popen(
-            [go_cmd, 'run', 'main.go'],
+            [executable_path],
             cwd=bridge_path,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            env=env
         )
         
         # Start output monitoring in a separate thread
@@ -393,35 +372,21 @@ def get_qr_code_from_running_bridge() -> Optional[str]:
     try:
         # Start bridge and capture initial output
         bridge_path = os.path.abspath(BRIDGE_DIR)
-        
-        # Find Go executable
-        go_cmd = None
-        for go_path in ['/usr/local/go/bin/go', '/opt/homebrew/bin/go', 'go']:
-            try:
-                result = subprocess.run([go_path, 'version'], capture_output=True, timeout=5)
-                if result.returncode == 0:
-                    go_cmd = go_path
-                    break
-            except (subprocess.SubprocessError, FileNotFoundError):
-                continue
-        
-        if not go_cmd:
+        executable_path = os.path.join(bridge_path, BRIDGE_EXECUTABLE)
+
+        if not os.path.exists(executable_path):
             return None
-        
-        # Prepare environment
-        env = os.environ.copy()
-        env['PATH'] = '/usr/local/go/bin:/opt/homebrew/bin:' + env.get('PATH', '')
-        env['GOPATH'] = env.get('GOPATH', os.path.expanduser('~/go'))
-        env['GOROOT'] = env.get('GOROOT', '/usr/local/go')
-        
+
+        # Make sure the binary is executable
+        os.chmod(executable_path, 0o755)
+
         # Start process and capture output for a few seconds
         process = subprocess.Popen(
-            [go_cmd, 'run', 'main.go'],
+            [executable_path],
             cwd=bridge_path,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            env=env
         )
         
         output_lines = []

@@ -554,6 +554,14 @@ def get_sync_status() -> Dict[str, Any]:
             "last_check": datetime.now().isoformat()
         }
 
+def initialize_bridge():
+    print("Initializing WhatsApp bridge...", flush=True)
+    success, message, qr_url = ensure_bridge_ready()
+    if not success:
+        print(f"Warning: Bridge initialization failed: {message}", flush=True)
+        if qr_url:
+            print(f"Please scan the QR code at: {qr_url}", flush=True)
+
 @mcp.tool()
 @with_bridge_check
 def check_bridge_status() -> Dict[str, Any]:
@@ -590,6 +598,8 @@ if __name__ == "__main__":
         transport_mode = 'stdio'
     
     print(f"Starting WhatsApp MCP server with {transport_mode} transport...")
+    
+    initialize_bridge()
     
     # Initialize and run the server
     if transport_mode == 'sse':
