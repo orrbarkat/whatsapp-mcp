@@ -11,16 +11,3 @@ dependencies = [
     "psutil>=6.1.0",
     "fastmcp>=2.11.0",
 ]
-
-[tool.setuptools]
-py-modules = [
-    "audio",
-    "main",
-    "whatsapp",
-]
-
-[project.optional-dependencies]
-test = [
-    "pytest>=8.3.2",
-    "pytest-mock>=3.14.0",
-]
