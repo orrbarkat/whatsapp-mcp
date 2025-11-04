@@ -57,20 +57,9 @@ type MessageStore struct {
 }
 
 // Initialize message store
-func NewMessageStore() (*MessageStore, error) {
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
-		return nil, fmt.Errorf("failed to create store directory: %v", err)
-	}
-
-	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
-	if err != nil {
-		return nil, fmt.Errorf("failed to open message database: %v", err)
-	}
-
+func NewMessageStore(db *sql.DB) (*MessageStore, error) {
 	// Create tables if they don't exist
-	_, err = db.Exec(`
+	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
@@ -101,6 +90,20 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	return &MessageStore{db: db}, nil
+}
+
+func initDB(dbPath string) (*sql.DB, error) {
+	// Create directory for database if it doesn't exist
+	if err := os.MkdirAll("store", 0755); err != nil {
+		return nil, fmt.Errorf("failed to create store directory: %v", err)
+	}
+
+	// Open SQLite database for messages
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open message database: %v", err)
+	}
+	return db, nil
 }
 
 // Close the database connection
@@ -1326,7 +1329,12 @@ func main() {
 	}
 
 	// Initialize message store
-	messageStore, err := NewMessageStore()
+	db, err := initDB("file:store/messages.db?_foreign_keys=on")
+	if err != nil {
+		logger.Errorf("Failed to initialize database: %v", err)
+		return
+	}
+	messageStore, err := NewMessageStore(db)
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
 		return

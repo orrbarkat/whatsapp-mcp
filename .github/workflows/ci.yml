@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.21'
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install -e "whatsapp-mcp-server[test]"
+
+      - name: Install Go dependencies
+        run: cd whatsapp-bridge && go mod tidy
+
+      - name: Run Python tests
+        run: pytest whatsapp-mcp-server/
+
+      - name: Run Go tests
+        run: cd whatsapp-bridge && go test -v
