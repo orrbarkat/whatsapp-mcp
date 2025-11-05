@@ -1,11 +1,30 @@
 services:
+  # PostgreSQL service (optional - uncomment to use PostgreSQL instead of SQLite)
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: whatsapp-postgres
+  #   environment:
+  #     POSTGRES_DB: whatsapp
+  #     POSTGRES_USER: whatsapp
+  #     POSTGRES_PASSWORD: whatsapp_password
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U whatsapp"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   restart: unless-stopped
+
   whatsapp-mcp:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: whatsapp-mcp
     volumes:
-      # Mount SQLite database directory to persist data
+      # Mount SQLite database directory to persist data (used when DATABASE_URL is not set)
       - whatsapp_data:/app/whatsapp-bridge/store
       # Mount a directory for QR code display
       - ./qr-codes:/app/qr-codes
@@ -16,14 +35,26 @@ services:
       - "8080:8080"
     environment:
       # Database and storage paths
-      - WHATSAPP_DB_PATH=/app/whatsapp-bridge/store
-      - DATABASE_PATH=/app/whatsapp-bridge/store/messages.db
+      # - WHATSAPP_DB_PATH=/app/whatsapp-bridge/store
+      # - DATABASE_PATH=/app/whatsapp-bridge/store/messages.db
+      # Database configuration (uncomment to use PostgreSQL or Supabase)
+      - DATABASE_URL=${DATABASE_URL}
+      # For PostgreSQL (using local postgres service):
+      # - DATABASE_URL=postgres://whatsapp:whatsapp_password@postgres:5432/whatsapp?sslmode=disable
+      # For Supabase:
+      # - DATABASE_URL=postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supabase.co:5432/postgres
+      # For separate session database (optional):
+      # - WHATSAPP_SESSION_DATABASE_URL=postgres://whatsapp:whatsapp_password@postgres:5432/whatsapp?sslmode=disable
       # MCP transport mode: 'stdio' (default for local) or 'sse' (recommended for Docker)
       - MCP_TRANSPORT=${MCP_TRANSPORT:-sse}
       # MCP server port for SSE transport
       - MCP_PORT=3000
       # Bridge API URL (localhost since both services are in same container)
       - WHATSAPP_BRIDGE_URL=http://localhost:8080
+    # Uncomment to wait for PostgreSQL to be ready before starting
+    # depends_on:
+    #   postgres:
+    #     condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/", "||", "exit", "1"]
@@ -35,3 +66,6 @@ services:
 volumes:
   whatsapp_data:
     driver: local
+  # Uncomment to use PostgreSQL
+  # postgres_data:
+  #   driver: local

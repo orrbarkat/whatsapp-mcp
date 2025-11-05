@@ -59,7 +59,24 @@ Here's an example of what you can do when it's connected to Claude.
    - **QR Code Page**: `http://localhost:8080/qr` - Authentication QR code when needed
    - **API Status**: `http://localhost:8080/api/status` - JSON status data
 
-3. **Connect to the MCP server**
+3. **Database Configuration (Optional)**
+
+   By default, the server uses SQLite with no configuration required. To use PostgreSQL or Supabase:
+
+   **For local runs (Option A):**
+   Set the environment variable before starting the bridge:
+   ```bash
+   export DATABASE_URL="postgres://username:password@localhost:5432/database_name"
+   # Or for Supabase:
+   export DATABASE_URL="postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supabase.co:5432/postgres"
+   ```
+
+   **For Claude Desktop (Option B):**
+   Add the `env` section to your MCP configuration (see step 3 below).
+
+   See the [Database Options](#database-options) section for detailed configuration examples.
+
+4. **Connect to the MCP server**
 
    Copy the below json with the appropriate {{PATH}} values:
 
@@ -73,7 +90,11 @@ Here's an example of what you can do when it's connected to Claude.
            "{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-mcp-server", // cd into the repo, run `pwd` and enter the output here + "/whatsapp-mcp-server"
            "run",
            "main.py"
-         ]
+         ],
+         // Optional: Set DATABASE_URL for PostgreSQL or Supabase
+         // "env": {
+         //   "DATABASE_URL": "postgres://username:password@localhost:5432/database_name"
+         // }
        }
      }
    }
@@ -91,7 +112,7 @@ Here's an example of what you can do when it's connected to Claude.
    ~/.cursor/mcp.json
    ```
 
-4. **Restart Claude Desktop / Cursor**
+5. **Restart Claude Desktop / Cursor**
 
    Open Claude Desktop and you should now see WhatsApp as an available integration.
 
@@ -129,9 +150,142 @@ This application consists of two main components:
 
 ### Data Storage
 
-- All message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory
+- All message history is stored in a database (SQLite by default, PostgreSQL supported)
 - The database maintains tables for chats and messages
 - Messages are indexed for efficient searching and retrieval
+
+### Database Options
+
+The WhatsApp MCP server supports multiple database backends through the `DATABASE_URL` environment variable:
+
+#### SQLite (Default)
+
+SQLite is the default option and requires no configuration. Data is stored locally in the `whatsapp-bridge/store/` directory.
+
+**Format:**
+```bash
+# No configuration needed - uses SQLite by default
+# Or explicitly set:
+DATABASE_URL="file:store/messages.db?_foreign_keys=on"
+```
+
+**Advantages:**
+- Zero configuration required
+- No external database server needed
+- Fast for local development
+- Portable database files
+
+#### PostgreSQL
+
+Use PostgreSQL for production deployments, shared environments, or Supabase integration.
+
+**Format:**
+```bash
+# Local PostgreSQL
+DATABASE_URL="postgres://username:password@localhost:5432/database_name"
+
+# PostgreSQL with SSL (production)
+DATABASE_URL="postgresql://username:password@host:5432/database_name?sslmode=require"
+```
+
+**Advantages:**
+- Better for production deployments
+- Supports concurrent access from multiple instances
+- Advanced querying and performance features
+- Cloud-hosted options available (Supabase, AWS RDS, etc.)
+
+#### Supabase
+
+Supabase provides a managed PostgreSQL database with additional features.
+
+**Format:**
+```bash
+DATABASE_URL="postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supabase.co:5432/postgres"
+```
+
+**Setup:**
+1. Create a Supabase project at [supabase.com](https://supabase.com)
+2. Find your connection string in Settings → Database
+3. Set the `DATABASE_URL` environment variable
+4. The schema will be created automatically on first run
+
+**Advantages:**
+- Managed PostgreSQL service
+- Automatic backups and scaling
+- Built-in authentication and storage
+- Free tier available
+
+#### Separate Session and Message Databases
+
+You can use different databases for WhatsApp session data (authentication) and message history:
+
+**Environment Variables:**
+```bash
+# Session database (authentication, device info)
+WHATSAPP_SESSION_DATABASE_URL="postgres://user:pass@host:5432/sessions"
+
+# Message database (chat history, media metadata)
+DATABASE_URL="postgres://user:pass@host:5432/messages"
+```
+
+**Behavior:**
+- If `WHATSAPP_SESSION_DATABASE_URL` is not set, both session and message data use `DATABASE_URL`
+- If neither is set, SQLite is used for both with separate database files
+- Mix and match: Use SQLite for sessions and PostgreSQL for messages, or vice versa
+
+#### Schema Management
+
+**Automatic Creation:**
+- Database tables are created automatically on first run
+- No manual migration required
+- Schema adapts to the selected database driver (SQLite vs PostgreSQL)
+
+**Type Mapping:**
+| SQLite Type | PostgreSQL Type | Usage |
+|-------------|-----------------|-------|
+| `BLOB` | `BYTEA` | Media keys, file hashes |
+| `INTEGER` | `BIGINT` | File sizes, IDs |
+| `TEXT` | `TEXT` | Messages, names, JIDs |
+| `TIMESTAMP` | `TIMESTAMP` | Message times |
+| `BOOLEAN` | `BOOLEAN` | Flags (is_from_me) |
+
+**Migration from SQLite to PostgreSQL:**
+1. Export your SQLite data (if needed)
+2. Set `DATABASE_URL` to your PostgreSQL connection string
+3. Restart the bridge - schema will be created automatically
+4. Import data (if migrating existing messages)
+
+Note: The bridge does not automatically migrate data between database types. If you have existing data in SQLite that you want to preserve, you'll need to export and import it manually.
+
+#### Docker Database Configuration
+
+When using Docker Compose, you can enable PostgreSQL by uncommenting the relevant sections in `docker-compose.yml`:
+
+**Enable PostgreSQL Service:**
+```yaml
+# Uncomment the postgres service
+postgres:
+  image: postgres:15-alpine
+  container_name: whatsapp-postgres
+  # ... (see docker-compose.yml)
+```
+
+**Configure Environment Variables:**
+```yaml
+environment:
+  # Uncomment and set DATABASE_URL
+  - DATABASE_URL=postgres://whatsapp:whatsapp_password@postgres:5432/whatsapp?sslmode=disable
+```
+
+**Enable Dependency:**
+```yaml
+# Uncomment depends_on
+depends_on:
+  postgres:
+    condition: service_healthy
+```
+
+See the [Running in Docker](#running-in-docker) section for complete Docker configuration details.
 
 ## Usage
 

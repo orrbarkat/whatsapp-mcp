@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 
@@ -51,32 +52,91 @@ type Message struct {
 	Filename  string
 }
 
+// DatabaseConfig holds database connection configuration
+type DatabaseConfig struct {
+	DriverName     string
+	DataSourceName string
+}
+
+// getDatabaseConfig parses DATABASE_URL environment variable to determine driver and DSN
+func getDatabaseConfig(envVar string, defaultDriver string, defaultDSN string) DatabaseConfig {
+	databaseURL := os.Getenv(envVar)
+
+	if databaseURL == "" {
+		// Return default configuration
+		return DatabaseConfig{
+			DriverName:     defaultDriver,
+			DataSourceName: defaultDSN,
+		}
+	}
+
+	// Parse DATABASE_URL
+	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {
+		// PostgreSQL connection string
+		return DatabaseConfig{
+			DriverName:     "postgres",
+			DataSourceName: databaseURL,
+		}
+	} else if strings.HasPrefix(databaseURL, "sqlite://") || strings.HasPrefix(databaseURL, "file:") {
+		// SQLite connection string
+		dsn := strings.TrimPrefix(databaseURL, "sqlite://")
+		return DatabaseConfig{
+			DriverName:     "sqlite3",
+			DataSourceName: dsn,
+		}
+	}
+
+	// If no prefix, assume it's a file path for SQLite
+	return DatabaseConfig{
+		DriverName:     "sqlite3",
+		DataSourceName: databaseURL,
+	}
+}
+
 // Database handler for storing message history
 type MessageStore struct {
-	db *sql.DB
+	db         *sql.DB
+	driverName string
 }
 
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
-		return nil, fmt.Errorf("failed to create store directory: %v", err)
+	// Get database configuration
+	config := getDatabaseConfig("DATABASE_URL", "sqlite3", "file:store/messages.db?_foreign_keys=on")
+
+	// Create directory for database if it doesn't exist (only for SQLite)
+	if config.DriverName == "sqlite3" {
+		if err := os.MkdirAll("store", 0755); err != nil {
+			return nil, fmt.Errorf("failed to create store directory: %v", err)
+		}
 	}
 
-	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	// Open database with selected driver
+	db, err := sql.Open(config.DriverName, config.DataSourceName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
 
-	// Create tables if they don't exist
-	_, err = db.Exec(`
+	fmt.Printf("Message store using driver: %s\n", config.DriverName)
+
+	// Determine dialect-sensitive types
+	var blobType, intType string
+	if config.DriverName == "postgres" {
+		blobType = "BYTEA"
+		intType = "BIGINT"
+	} else {
+		blobType = "BLOB"
+		intType = "INTEGER"
+	}
+
+	// Create tables with dialect-specific types
+	createTablesSQL := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
 			last_message_time TIMESTAMP
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -87,20 +147,22 @@ func NewMessageStore() (*MessageStore, error) {
 			media_type TEXT,
 			filename TEXT,
 			url TEXT,
-			media_key BLOB,
-			file_sha256 BLOB,
-			file_enc_sha256 BLOB,
-			file_length INTEGER,
+			media_key %s,
+			file_sha256 %s,
+			file_enc_sha256 %s,
+			file_length %s,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
-	`)
+	`, blobType, blobType, blobType, intType)
+
+	_, err = db.Exec(createTablesSQL)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return &MessageStore{db: db}, nil
+	return &MessageStore{db: db, driverName: config.DriverName}, nil
 }
 
 // Close the database connection
@@ -108,12 +170,39 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
+// makePlaceholder generates the appropriate placeholder for the driver
+func (store *MessageStore) makePlaceholder(index int) string {
+	if store.driverName == "postgres" {
+		return fmt.Sprintf("$%d", index)
+	}
+	return "?"
+}
+
+// makePlaceholders generates a comma-separated list of placeholders
+func (store *MessageStore) makePlaceholders(count int) string {
+	placeholders := make([]string, count)
+	for i := 0; i < count; i++ {
+		placeholders[i] = store.makePlaceholder(i + 1)
+	}
+	return strings.Join(placeholders, ", ")
+}
+
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
-	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
-	)
+	var query string
+	if store.driverName == "postgres" {
+		query = fmt.Sprintf(`
+			INSERT INTO chats (jid, name, last_message_time)
+			VALUES (%s, %s, %s)
+			ON CONFLICT (jid) DO UPDATE SET
+				name = EXCLUDED.name,
+				last_message_time = EXCLUDED.last_message_time
+		`, store.makePlaceholder(1), store.makePlaceholder(2), store.makePlaceholder(3))
+	} else {
+		query = "INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)"
+	}
+
+	_, err := store.db.Exec(query, jid, name, lastMessageTime)
 	return err
 }
 
@@ -125,10 +214,35 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		return nil
 	}
 
-	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	var query string
+	if store.driverName == "postgres" {
+		query = fmt.Sprintf(`
+			INSERT INTO messages
+			(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+			VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+			ON CONFLICT (id, chat_jid) DO UPDATE SET
+				sender = EXCLUDED.sender,
+				content = EXCLUDED.content,
+				timestamp = EXCLUDED.timestamp,
+				is_from_me = EXCLUDED.is_from_me,
+				media_type = EXCLUDED.media_type,
+				filename = EXCLUDED.filename,
+				url = EXCLUDED.url,
+				media_key = EXCLUDED.media_key,
+				file_sha256 = EXCLUDED.file_sha256,
+				file_enc_sha256 = EXCLUDED.file_enc_sha256,
+				file_length = EXCLUDED.file_length
+		`, store.makePlaceholder(1), store.makePlaceholder(2), store.makePlaceholder(3), store.makePlaceholder(4),
+			store.makePlaceholder(5), store.makePlaceholder(6), store.makePlaceholder(7), store.makePlaceholder(8),
+			store.makePlaceholder(9), store.makePlaceholder(10), store.makePlaceholder(11), store.makePlaceholder(12),
+			store.makePlaceholder(13))
+	} else {
+		query = `INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	}
+
+	_, err := store.db.Exec(query,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
@@ -136,10 +250,12 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
-	rows, err := store.db.Query(
-		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
-		chatJID, limit,
+	query := fmt.Sprintf(
+		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = %s ORDER BY timestamp DESC LIMIT %s",
+		store.makePlaceholder(1), store.makePlaceholder(2),
 	)
+
+	rows, err := store.db.Query(query, chatJID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +278,9 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 
 // Get all chats
 func (store *MessageStore) GetChats() (map[string]time.Time, error) {
-	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
+	query := "SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC"
+
+	rows, err := store.db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -496,10 +614,13 @@ type DownloadMediaResponse struct {
 
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
-	_, err := store.db.Exec(
-		"UPDATE messages SET url = ?, media_key = ?, file_sha256 = ?, file_enc_sha256 = ?, file_length = ? WHERE id = ? AND chat_jid = ?",
-		url, mediaKey, fileSHA256, fileEncSHA256, fileLength, id, chatJID,
+	query := fmt.Sprintf(
+		"UPDATE messages SET url = %s, media_key = %s, file_sha256 = %s, file_enc_sha256 = %s, file_length = %s WHERE id = %s AND chat_jid = %s",
+		store.makePlaceholder(1), store.makePlaceholder(2), store.makePlaceholder(3), store.makePlaceholder(4),
+		store.makePlaceholder(5), store.makePlaceholder(6), store.makePlaceholder(7),
 	)
+
+	_, err := store.db.Exec(query, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, id, chatJID)
 	return err
 }
 
@@ -509,10 +630,12 @@ func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, str
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
 	var fileLength uint64
 
-	err := store.db.QueryRow(
-		"SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ?",
-		id, chatJID,
-	).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
+	query := fmt.Sprintf(
+		"SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = %s AND chat_jid = %s",
+		store.makePlaceholder(1), store.makePlaceholder(2),
+	)
+
+	err := store.db.QueryRow(query, id, chatJID).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
 
 	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
 }
@@ -580,10 +703,11 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	if err != nil {
 		// Try to get basic info if extended info isn't available
-		err = messageStore.db.QueryRow(
-			"SELECT media_type, filename FROM messages WHERE id = ? AND chat_jid = ?",
-			messageID, chatJID,
-		).Scan(&mediaType, &filename)
+		basicQuery := fmt.Sprintf(
+			"SELECT media_type, filename FROM messages WHERE id = %s AND chat_jid = %s",
+			messageStore.makePlaceholder(1), messageStore.makePlaceholder(2),
+		)
+		err = messageStore.db.QueryRow(basicQuery, messageID, chatJID).Scan(&mediaType, &filename)
 
 		if err != nil {
 			return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
@@ -1293,13 +1417,27 @@ func main() {
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
-		logger.Errorf("Failed to create store directory: %v", err)
-		return
+	// Get session database configuration
+	// Support separate WHATSAPP_SESSION_DATABASE_URL or fall back to DATABASE_URL
+	sessionConfig := getDatabaseConfig("WHATSAPP_SESSION_DATABASE_URL", "sqlite3", "file:store/whatsapp.db?_foreign_keys=on")
+
+	// If WHATSAPP_SESSION_DATABASE_URL is not set, try DATABASE_URL with a different default
+	if os.Getenv("WHATSAPP_SESSION_DATABASE_URL") == "" && os.Getenv("DATABASE_URL") != "" {
+		// Use DATABASE_URL but for session database
+		sessionConfig = getDatabaseConfig("DATABASE_URL", "sqlite3", "file:store/whatsapp.db?_foreign_keys=on")
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	// Create directory for database if it doesn't exist (only for SQLite)
+	if sessionConfig.DriverName == "sqlite3" {
+		if err := os.MkdirAll("store", 0755); err != nil {
+			logger.Errorf("Failed to create store directory: %v", err)
+			return
+		}
+	}
+
+	fmt.Printf("Session store using driver: %s\n", sessionConfig.DriverName)
+
+	container, err := sqlstore.New(context.Background(), sessionConfig.DriverName, sessionConfig.DataSourceName, dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -1461,7 +1599,8 @@ func main() {
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
 	var existingName string
-	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
+	nameQuery := fmt.Sprintf("SELECT name FROM chats WHERE jid = %s", messageStore.makePlaceholder(1))
+	err := messageStore.db.QueryRow(nameQuery, chatJID).Scan(&existingName)
 	if err == nil && existingName != "" {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)

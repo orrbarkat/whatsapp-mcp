@@ -1,0 +1,66 @@
+# WhatsApp MCP Server Database Configuration
+# ============================================
+#
+# This configuration file is OPTIONAL. Environment variables take precedence.
+# If neither this file nor environment variables are set, the server will
+# default to using in-memory SQLite databases.
+#
+# Priority order for configuration:
+# 1. DATABASE_URL environment variable (highest priority)
+# 2. This config.yaml file
+# 3. Default in-memory SQLite (if nothing is configured)
+
+database:
+  # Database connection URL
+  # Uncomment and configure ONE of the following examples:
+
+  # --- SQLite (File-based) ---
+  # Store data in local SQLite database files
+  # url: sqlite:///path/to/database/directory/db.db
+  # Note: The server will create messages.db and whatsapp.db in the same directory
+
+  # Example for macOS/Linux:
+  # url: sqlite:////Users/username/whatsapp-mcp/store/db.db
+
+  # Example for Windows:
+  # url: sqlite:///C:/Users/username/whatsapp-mcp/store/db.db
+
+  # --- SQLite (In-Memory) ---
+  # Temporary database stored in RAM (data is lost when server stops)
+  # url: sqlite://:memory:
+
+  # --- PostgreSQL via Supabase ---
+  # Use Supabase (PostgreSQL) for cloud-based storage
+  # Requires SUPABASE_URL and SUPABASE_KEY (or SUPABASE_ANON_KEY) environment variables
+  # url: postgresql://user:password@host:port/database
+  #
+  # IMPORTANT SECURITY NOTE:
+  # When using Supabase, you MUST set these environment variables:
+  #   export SUPABASE_URL="https://your-project.supabase.co"
+  #   export SUPABASE_KEY="your-anon-key-here"
+  #
+  # DO NOT put your Supabase credentials directly in this file!
+  # Use environment variables to keep your credentials secure.
+
+  # --- Direct PostgreSQL ---
+  # Connect directly to a PostgreSQL database (requires Supabase client)
+  # url: postgresql://username:password@localhost:5432/whatsapp
+  #
+  # SECURITY NOTE:
+  # Avoid putting passwords in this file. Use environment variables instead:
+  #   export DATABASE_URL="postgresql://user:pass@host:port/db"
+
+# Example configurations:
+# =======================
+
+# Development (local files):
+# database:
+#   url: sqlite:///./store/db.db
+
+# Testing (temporary in-memory):
+# database:
+#   url: sqlite://:memory:
+
+# Production (Supabase cloud):
+# database:
+#   url: postgresql://dummy  # Actual connection via SUPABASE_URL and SUPABASE_KEY env vars

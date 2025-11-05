@@ -20,8 +20,10 @@ from whatsapp import (
     download_media as whatsapp_download_media,
     ensure_bridge_ready,
     get_bridge_status,
+    format_messages_list,
+    format_message,
     MESSAGES_DB_PATH,
-    
+
 )
 import sqlite3
 import os
@@ -105,9 +107,9 @@ def list_messages(
     include_context: bool = True,
     context_before: int = 1,
     context_after: int = 1
-) -> List[Dict[str, Any]]:
+) -> str:
     """Get WhatsApp messages matching specified criteria with optional context.
-    
+
     Args:
         after: Optional ISO-8601 formatted string to only return messages after this date
         before: Optional ISO-8601 formatted string to only return messages before this date
@@ -119,6 +121,9 @@ def list_messages(
         include_context: Whether to include messages before and after matches (default True)
         context_before: Number of messages to include before each match (default 1)
         context_after: Number of messages to include after each match (default 1)
+
+    Returns:
+        Formatted string of messages
     """
     messages = whatsapp_list_messages(
         after=after,
@@ -132,7 +137,8 @@ def list_messages(
         context_before=context_before,
         context_after=context_after
     )
-    return messages
+    # Format the messages for display
+    return format_messages_list(messages, show_chat_info=True)
 
 @mcp.tool()
 @with_bridge_check
@@ -201,12 +207,18 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
 @with_bridge_check
 def get_last_interaction(jid: str) -> str:
     """Get most recent WhatsApp message involving the contact.
-    
+
     Args:
         jid: The JID of the contact to search for
+
+    Returns:
+        Formatted string representation of the last message, or a message if none found
     """
     message = whatsapp_get_last_interaction(jid)
-    return message
+    if message:
+        return format_message(message, show_chat_info=True)
+    else:
+        return "No messages found for this contact"
 
 @mcp.tool()
 @with_bridge_check

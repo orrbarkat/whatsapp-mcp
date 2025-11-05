@@ -27,7 +27,6 @@ FROM python:3.11-slim-bookworm
 
 # Install system dependencies including Go runtime, ffmpeg, and sqlite
 RUN apt-get update && apt-get install -y \
-    golang-go \
     ffmpeg \
     sqlite3 \
     ca-certificates \
@@ -67,8 +66,6 @@ EXPOSE 3000 8080
 
 # Set environment variables for proper paths
 ENV WHATSAPP_DB_PATH=/app/whatsapp-bridge/store
-ENV GOPATH=/tmp/go
-ENV GOROOT=/usr/lib/go-1.24
 
 # Run the MCP server - it will automatically manage the bridge process
 CMD ["uv", "run", "main.py"]
