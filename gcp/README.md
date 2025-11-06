@@ -65,6 +65,10 @@ This guide provides comprehensive instructions for deploying the WhatsApp MCP Se
 
 ## Storage Configuration
 
+### Option A: GCS Session Storage (SQLite-based)
+
+**Note:** GCS session backup only works with SQLite session storage. For production, consider Supabase Postgres sessions (Option B) instead.
+
 1. Create GCS bucket for session storage:
    ```bash
    # Create bucket (replace with your desired name)
@@ -78,16 +82,110 @@ This guide provides comprehensive instructions for deploying the WhatsApp MCP Se
    # Create encryption key
    gcloud kms keyrings create whatsapp-mcp \
      --location=us-central1
-   
+
    gcloud kms keys create sessions-key \
      --keyring=whatsapp-mcp \
      --location=us-central1 \
      --purpose=encryption
-   
+
    # Configure bucket encryption
    gcloud storage buckets update gs://YOUR_PROJECT-whatsapp-sessions \
      --default-kms-key=projects/YOUR_PROJECT/locations/us-central1/keyRings/whatsapp-mcp/cryptoKeys/sessions-key
    ```
+
+### Option B: Supabase Session Storage (Recommended for Production)
+
+Store WhatsApp sessions in Supabase Postgres for better persistence and multi-instance support.
+
+**Step 1: Run Session Tables Migration**
+
+```bash
+# Using Supabase SQL Editor (Recommended)
+# 1. Go to your Supabase project dashboard
+# 2. Navigate to SQL Editor
+# 3. Copy contents of ../whatsapp-mcp-server/migrations/010_create_whatsmeow_session_tables.sql
+# 4. Paste and execute
+
+# Or using psql
+psql "postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres" \
+  -f ../whatsapp-mcp-server/migrations/010_create_whatsmeow_session_tables.sql
+```
+
+**Step 2: Verify Tables**
+
+```sql
+-- Check devices table exists
+SELECT to_regclass('public.devices');
+
+-- Verify all 13 session tables exist
+SELECT count(*) FROM pg_tables
+WHERE schemaname = 'public'
+AND tablename IN ('devices', 'identities', 'prekeys', 'sessions', 'sender_keys',
+                  'signed_prekeys', 'app_state_sync_keys', 'app_state_version',
+                  'app_state_mutation_macs', 'contacts', 'chat_settings',
+                  'message_secrets', 'privacy_tokens');
+-- Should return 13
+```
+
+**Step 3: Create Secret for Session DSN**
+
+```bash
+# Create session DSN secret
+echo -n "postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres?sslmode=require" | \
+  gcloud secrets create whatsapp-mcp-session-dsn \
+  --replication-policy="automatic" \
+  --data-file=-
+
+# If already exists, add new version
+echo -n "postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres?sslmode=require" | \
+  gcloud secrets versions add whatsapp-mcp-session-dsn \
+  --data-file=-
+```
+
+**Step 4: Update Cloud Run Configuration**
+
+In your `cloudrun.yaml`, uncomment the session DSN environment variable:
+
+```yaml
+# Session database configuration
+- name: WHATSAPP_SESSION_DATABASE_URL
+  valueFrom:
+    secretKeyRef:
+      name: whatsapp-mcp-session-dsn
+      key: latest
+```
+
+**Step 5: Grant Service Account Access**
+
+```bash
+# Grant access to session DSN secret
+gcloud secrets add-iam-policy-binding whatsapp-mcp-session-dsn \
+  --member="serviceAccount:whatsapp-mcp@YOUR_PROJECT.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+**Step 6: Verify Deployment**
+
+```bash
+# Check bridge logs
+gcloud run services logs read whatsapp-mcp --region=us-central1 --limit=50
+
+# Look for:
+# "Using Postgres session store"
+# "Postgres session DSN host: db.[PROJECT-REF].supabase.co"
+# "✓ Session tables validated successfully"
+
+# Check session backend status via API
+curl https://[YOUR-SERVICE-URL]/api/session-backend
+```
+
+**Notes:**
+
+- GCS session backup is automatically disabled when using Postgres sessions
+- Use Supabase's built-in backups or `pg_dump` for session backup
+- Session tables have RLS enabled with deny-all policies for security
+- Only the Go bridge (using direct Postgres connection) can access session tables
+- For complete documentation, see `../whatsapp-mcp-server/migrations/README.md`
 
 ## Service Account Setup
 

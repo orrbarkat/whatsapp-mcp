@@ -41,10 +41,18 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       # For PostgreSQL (using local postgres service):
       # - DATABASE_URL=postgres://whatsapp:whatsapp_password@postgres:5432/whatsapp?sslmode=disable
-      # For Supabase:
-      # - DATABASE_URL=postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supabase.co:5432/postgres
-      # For separate session database (optional):
+      # For Supabase (messages database):
+      # - DATABASE_URL=postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supabase.co:5432/postgres?sslmode=require
+      # - SUPABASE_URL=https://[YOUR-PROJECT-REF].supabase.co
+      # - SUPABASE_KEY=[YOUR-SERVICE-KEY]
+      #
+      # Session database configuration (optional - defaults to DATABASE_URL if not set):
+      # For separate Supabase session storage (recommended for production):
+      # - WHATSAPP_SESSION_DATABASE_URL=postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supabase.co:5432/postgres?sslmode=require
+      # For local PostgreSQL session storage:
       # - WHATSAPP_SESSION_DATABASE_URL=postgres://whatsapp:whatsapp_password@postgres:5432/whatsapp?sslmode=disable
+      # For SQLite session storage (default):
+      # - WHATSAPP_SESSION_DATABASE_URL=sqlite:///app/whatsapp-bridge/store/whatsapp.db
       # MCP transport mode: 'stdio' (default for local) or 'sse' (recommended for Docker)
       - MCP_TRANSPORT=${MCP_TRANSPORT:-sse}
       # MCP server port for SSE transport

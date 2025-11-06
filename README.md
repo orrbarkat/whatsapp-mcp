@@ -217,23 +217,56 @@ DATABASE_URL="postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supaba
 - Built-in authentication and storage
 - Free tier available
 
-#### Separate Session and Message Databases
+#### Configuration Matrix
 
-You can use different databases for WhatsApp session data (authentication) and message history:
+The WhatsApp MCP server supports independent configuration of two database concerns:
 
-**Environment Variables:**
+| Database Type | Purpose | Environment Variable | Default |
+|---------------|---------|---------------------|---------|
+| **Messages** | Chat history, message content, media metadata | `DATABASE_URL` | SQLite: `file:store/messages.db` |
+| **Sessions** | WhatsApp authentication, device keys, contacts | `WHATSAPP_SESSION_DATABASE_URL` | Falls back to `DATABASE_URL`, then SQLite: `file:store/whatsapp.db` |
+
+**Supported Combinations:**
+
+| Messages DB | Session DB | Use Case | Configuration |
+|-------------|------------|----------|---------------|
+| SQLite | SQLite | Default local development | No configuration needed |
+| PostgreSQL/Supabase | PostgreSQL/Supabase (same) | Production with shared database | Set `DATABASE_URL` only |
+| PostgreSQL/Supabase | PostgreSQL/Supabase (separate) | Production with isolated databases | Set both `DATABASE_URL` and `WHATSAPP_SESSION_DATABASE_URL` |
+| SQLite | PostgreSQL/Supabase | Local messages, remote sessions | Set `WHATSAPP_SESSION_DATABASE_URL` only |
+| PostgreSQL/Supabase | SQLite | Remote messages, local sessions | Set `DATABASE_URL` only |
+
+**Environment Variable Precedence:**
+
 ```bash
-# Session database (authentication, device info)
-WHATSAPP_SESSION_DATABASE_URL="postgres://user:pass@host:5432/sessions"
+# Messages database (used by Python MCP server and Go bridge)
+DATABASE_URL → defaults to SQLite: file:store/messages.db
 
-# Message database (chat history, media metadata)
-DATABASE_URL="postgres://user:pass@host:5432/messages"
+# Session database (used only by Go bridge for whatsmeow session storage)
+WHATSAPP_SESSION_DATABASE_URL → falls back to DATABASE_URL → defaults to SQLite: file:store/whatsapp.db
 ```
 
-**Behavior:**
-- If `WHATSAPP_SESSION_DATABASE_URL` is not set, both session and message data use `DATABASE_URL`
-- If neither is set, SQLite is used for both with separate database files
-- Mix and match: Use SQLite for sessions and PostgreSQL for messages, or vice versa
+**Example Configurations:**
+
+```bash
+# Local development (default)
+# No configuration needed - uses SQLite for both
+
+# Production: All data in Supabase
+export DATABASE_URL="postgresql://postgres:[PASSWORD]@db.[PROJECT].supabase.co:5432/postgres?sslmode=require"
+export SUPABASE_URL="https://[PROJECT].supabase.co"
+export SUPABASE_KEY="[SERVICE-KEY]"
+
+# Production: Separate Supabase databases for messages and sessions
+export DATABASE_URL="postgresql://postgres:[PASSWORD]@db.[PROJECT].supabase.co:5432/postgres?sslmode=require"
+export WHATSAPP_SESSION_DATABASE_URL="postgresql://postgres:[PASSWORD]@db.[PROJECT].supabase.co:5432/postgres?sslmode=require"
+export SUPABASE_URL="https://[PROJECT].supabase.co"
+export SUPABASE_KEY="[SERVICE-KEY]"
+
+# Hybrid: Local sessions, remote messages
+export DATABASE_URL="postgresql://postgres:[PASSWORD]@db.[PROJECT].supabase.co:5432/postgres?sslmode=require"
+# WHATSAPP_SESSION_DATABASE_URL not set, uses local SQLite
+```
 
 #### Schema Management
 
@@ -337,6 +370,153 @@ See `gcp/DATABASE_SETUP.md` for detailed Cloud SQL setup instructions.
 4. Import data (if migrating existing messages)
 
 Note: The bridge does not automatically migrate data between database types. If you have existing data in SQLite that you want to preserve, you'll need to export and import it manually.
+
+#### Storing WhatsApp Sessions in Supabase
+
+**Overview**
+
+By default, WhatsApp session data (authentication, device keys, contacts) is stored in local SQLite files. For production deployments, you can store sessions in Supabase Postgres for better persistence, backup, and multi-instance support.
+
+**Step 1: Run Session Tables Migration**
+
+The Go bridge requires specific tables created by `go.mau.fi/whatsmeow/store/sqlstore`. Run the migration:
+
+```bash
+# Option A: Using Supabase SQL Editor (Recommended)
+# 1. Go to your Supabase project dashboard
+# 2. Navigate to SQL Editor
+# 3. Copy contents of whatsapp-mcp-server/migrations/010_create_whatsmeow_session_tables.sql
+# 4. Paste and execute
+
+# Option B: Using psql
+psql "postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supabase.co:5432/postgres" \
+  -f whatsapp-mcp-server/migrations/010_create_whatsmeow_session_tables.sql
+```
+
+This creates 13 tables: `devices`, `identities`, `prekeys`, `sessions`, `sender_keys`, `signed_prekeys`, `app_state_sync_keys`, `app_state_version`, `app_state_mutation_macs`, `contacts`, `chat_settings`, `message_secrets`, `privacy_tokens`.
+
+**Step 2: Verify Tables**
+
+```sql
+-- Check devices table exists
+SELECT to_regclass('public.devices');
+-- Should return: "devices"
+
+-- Verify all 13 session tables exist
+SELECT tablename FROM pg_tables
+WHERE schemaname = 'public'
+AND tablename IN ('devices', 'identities', 'prekeys', 'sessions', 'sender_keys',
+                  'signed_prekeys', 'app_state_sync_keys', 'app_state_version',
+                  'app_state_mutation_macs', 'contacts', 'chat_settings',
+                  'message_secrets', 'privacy_tokens');
+-- Should return 13 rows
+```
+
+**Step 3: Configure Session DSN**
+
+Set the `WHATSAPP_SESSION_DATABASE_URL` environment variable with your Supabase Postgres connection string:
+
+```bash
+# Format (ensure sslmode=require for Supabase)
+export WHATSAPP_SESSION_DATABASE_URL="postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres?sslmode=require"
+```
+
+**Important:** Use your Supabase **service key** (not anon key) for the Python MCP server, as the session tables have RLS enabled with deny-all policies.
+
+**Step 4: Deploy with Session DSN**
+
+**For Docker Compose:**
+```yaml
+environment:
+  - WHATSAPP_SESSION_DATABASE_URL=postgresql://postgres:[PASSWORD]@db.[PROJECT].supabase.co:5432/postgres?sslmode=require
+```
+
+**For Cloud Run (via Secret Manager):**
+```bash
+# Create secret
+gcloud secrets create whatsapp-mcp-session-dsn \
+  --data-file=- <<EOF
+postgresql://postgres:[PASSWORD]@db.[PROJECT].supabase.co:5432/postgres?sslmode=require
+EOF
+
+# Grant access
+gcloud secrets add-iam-policy-binding whatsapp-mcp-session-dsn \
+  --member="serviceAccount:[SERVICE-ACCOUNT]@[PROJECT].iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+
+# Reference in cloudrun.yaml (uncomment):
+# - name: WHATSAPP_SESSION_DATABASE_URL
+#   valueFrom:
+#     secretKeyRef:
+#       name: whatsapp-mcp-session-dsn
+#       key: latest
+```
+
+**For Terraform:**
+
+Terraform configuration already includes the `session_dsn` secret resource. Update the value:
+
+```bash
+# After applying terraform
+gcloud secrets versions add whatsapp-mcp-session-dsn \
+  --data-file=- <<EOF
+postgresql://postgres:[PASSWORD]@db.[PROJECT].supabase.co:5432/postgres?sslmode=require
+EOF
+```
+
+**Step 5: Verify**
+
+Check the bridge logs and session backend status:
+
+```bash
+# Bridge logs should show:
+# "Using Postgres session store"
+# "Postgres session DSN host: db.[PROJECT].supabase.co"
+# "✓ Session tables validated successfully"
+
+# Check via API:
+curl http://localhost:8080/api/session-backend
+# Response should include:
+# "backend": "postgres"
+# "session_tables_ok": true
+# "session_host": "db.[PROJECT].supabase.co"
+```
+
+**Security Notes:**
+
+- Session tables have Row Level Security (RLS) enabled with deny-all policies by default
+- Only `service_role` can access session tables (anon/authenticated roles cannot)
+- The Go bridge connects directly and bypasses RLS
+- Client-side Supabase SDKs must never access session tables
+- Store the service key in Secret Manager, not in environment variables
+
+**GCS Backup Behavior:**
+
+GCS session backup (`GCS_SESSION_BUCKET`) only works with SQLite sessions. If using Postgres/Supabase for sessions:
+- GCS upload/download is automatically skipped
+- Use Supabase's built-in backups or `pg_dump` for session backup
+- Bridge logs will indicate "GCS session backup is only for SQLite, skipping"
+
+**Troubleshooting:**
+
+```bash
+# If bridge fails to start:
+# 1. Check migration was applied
+SELECT to_regclass('public.devices');
+
+# 2. Check connection string includes sslmode
+echo $WHATSAPP_SESSION_DATABASE_URL | grep sslmode=require
+
+# 3. Check RLS permissions
+SELECT grantee, privilege_type FROM information_schema.table_privileges
+WHERE table_name = 'devices';
+# Should show service_role has SELECT, INSERT, UPDATE, DELETE
+
+# 4. Test connection
+psql "$WHATSAPP_SESSION_DATABASE_URL" -c "SELECT 1"
+```
+
+For complete migration documentation, see `whatsapp-mcp-server/migrations/README.md`.
 
 #### Docker Database Configuration
 

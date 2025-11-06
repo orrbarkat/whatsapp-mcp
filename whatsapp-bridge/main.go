@@ -1528,6 +1528,86 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(response)
 	})
 
+	// Handler for session backend status (enhanced diagnostics)
+	http.HandleFunc("/api/session-backend", func(w http.ResponseWriter, r *http.Request) {
+		// Get session config
+		sessionCfg := getDatabaseConfig("WHATSAPP_SESSION_DATABASE_URL", "sqlite3", "file:store/whatsapp.db?_foreign_keys=on")
+		if os.Getenv("WHATSAPP_SESSION_DATABASE_URL") == "" && os.Getenv("DATABASE_URL") != "" {
+			sessionCfg = getDatabaseConfig("DATABASE_URL", "sqlite3", "file:store/whatsapp.db?_foreign_keys=on")
+		}
+
+		response := map[string]interface{}{
+			"backend":            sessionCfg.DriverName,
+			"session_tables_ok":  false,
+			"message_backend":    "unknown",
+			"message_tables_ok":  false,
+			"errors":             []string{},
+		}
+
+		// Check session backend tables
+		if sessionCfg.DriverName == "postgres" {
+			// Extract sanitized host
+			dsnHost := "unknown"
+			if strings.Contains(sessionCfg.DataSourceName, "@") {
+				parts := strings.Split(sessionCfg.DataSourceName, "@")
+				if len(parts) > 1 {
+					hostPart := parts[1]
+					if idx := strings.Index(hostPart, "/"); idx > 0 {
+						dsnHost = hostPart[:idx]
+					} else {
+						dsnHost = hostPart
+					}
+				}
+			}
+			response["session_host"] = dsnHost
+
+			// Test connection and table existence
+			testDB, err := sql.Open(sessionCfg.DriverName, sessionCfg.DataSourceName)
+			if err != nil {
+				response["errors"] = append(response["errors"].([]string), fmt.Sprintf("Failed to open session DB: %v", err))
+			} else {
+				defer testDB.Close()
+				if err := testDB.Ping(); err != nil {
+					response["errors"] = append(response["errors"].([]string), fmt.Sprintf("Failed to ping session DB: %v", err))
+				} else {
+					var devicesExists bool
+					err = testDB.QueryRow("SELECT to_regclass('public.devices') IS NOT NULL").Scan(&devicesExists)
+					if err != nil {
+						response["errors"] = append(response["errors"].([]string), fmt.Sprintf("Failed to check session tables: %v", err))
+					} else {
+						response["session_tables_ok"] = devicesExists
+						if !devicesExists {
+							response["errors"] = append(response["errors"].([]string), "Session table 'devices' does not exist. Run migration 010_create_whatsmeow_session_tables.sql")
+						}
+					}
+				}
+			}
+		} else {
+			// SQLite
+			localPath := sessionCfg.DataSourceName
+			localPath = strings.TrimPrefix(localPath, "file:")
+			if idx := strings.Index(localPath, "?"); idx >= 0 {
+				localPath = localPath[:idx]
+			}
+			response["session_path"] = localPath
+			if _, err := os.Stat(localPath); err == nil {
+				response["session_tables_ok"] = true
+			}
+		}
+
+		// Check message backend
+		messageCfg := getDatabaseConfig("DATABASE_URL", "sqlite3", "file:store/messages.db?_foreign_keys=on")
+		response["message_backend"] = messageCfg.DriverName
+
+		if messageStore != nil {
+			response["message_tables_ok"] = true
+			response["message_backend"] = messageStore.driverName
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -1558,12 +1638,75 @@ func main() {
 		sessionConfig = getDatabaseConfig("DATABASE_URL", "sqlite3", "file:store/whatsapp.db?_foreign_keys=on")
 	}
 
-	// Create directory for database if it doesn't exist (only for SQLite)
-	if sessionConfig.DriverName == "sqlite3" {
+	// Validate and log session configuration
+	if sessionConfig.DriverName == "postgres" {
+		logger.Infof("Using Postgres session store")
+
+		// Parse DSN to extract host for logging (without credentials)
+		dsnHost := "unknown"
+		if strings.Contains(sessionConfig.DataSourceName, "@") {
+			parts := strings.Split(sessionConfig.DataSourceName, "@")
+			if len(parts) > 1 {
+				hostPart := parts[1]
+				if idx := strings.Index(hostPart, "/"); idx > 0 {
+					dsnHost = hostPart[:idx]
+				} else {
+					dsnHost = hostPart
+				}
+			}
+		}
+		logger.Infof("Postgres session DSN host: %s", dsnHost)
+
+		// Check if sslmode is set
+		if !strings.Contains(sessionConfig.DataSourceName, "sslmode=") {
+			logger.Warnf("No sslmode specified in session DSN, appending sslmode=require")
+			// Append sslmode=require
+			if strings.Contains(sessionConfig.DataSourceName, "?") {
+				sessionConfig.DataSourceName += "&sslmode=require"
+			} else {
+				sessionConfig.DataSourceName += "?sslmode=require"
+			}
+		}
+
+		// Open temporary connection to validate session tables exist
+		logger.Infof("Validating Postgres session tables...")
+		testDB, err := sql.Open(sessionConfig.DriverName, sessionConfig.DataSourceName)
+		if err != nil {
+			logger.Errorf("Failed to open Postgres session database: %v", err)
+			logger.Errorf("Please ensure WHATSAPP_SESSION_DATABASE_URL is set correctly")
+			return
+		}
+		defer testDB.Close()
+
+		if err := testDB.Ping(); err != nil {
+			logger.Errorf("Failed to connect to Postgres session database: %v", err)
+			logger.Errorf("Please check your database connection and credentials")
+			return
+		}
+
+		// Check for required tables (devices is the primary whatsmeow table)
+		var devicesExists bool
+		err = testDB.QueryRow("SELECT to_regclass('public.devices') IS NOT NULL").Scan(&devicesExists)
+		if err != nil {
+			logger.Errorf("Failed to check for session tables: %v", err)
+			return
+		}
+
+		if !devicesExists {
+			logger.Errorf("Required session table 'devices' does not exist")
+			logger.Errorf("Please run migration 010_create_whatsmeow_session_tables.sql")
+			logger.Errorf("See migrations/README.md for instructions")
+			return
+		}
+
+		logger.Infof("✓ Session tables validated successfully")
+	} else {
+		// SQLite session store - create directory if needed
 		if err := os.MkdirAll("store", 0755); err != nil {
 			logger.Errorf("Failed to create store directory: %v", err)
 			return
 		}
+		logger.Infof("Using SQLite session store at: %s", sessionConfig.DataSourceName)
 	}
 
 	// Download session from GCS if configured (before initializing sqlstore)
@@ -1573,19 +1716,24 @@ func main() {
 		gcsObjectName = "whatsapp.db"
 	}
 
-	if gcsBucket != "" && sessionConfig.DriverName == "sqlite3" {
-		// Extract local SQLite path from DSN
-		localPath := sessionConfig.DataSourceName
-		// Trim "file:" prefix if present
-		localPath = strings.TrimPrefix(localPath, "file:")
-		// Drop query parameters
-		if idx := strings.Index(localPath, "?"); idx >= 0 {
-			localPath = localPath[:idx]
-		}
+	if gcsBucket != "" {
+		if sessionConfig.DriverName == "sqlite3" {
+			// Extract local SQLite path from DSN
+			localPath := sessionConfig.DataSourceName
+			// Trim "file:" prefix if present
+			localPath = strings.TrimPrefix(localPath, "file:")
+			// Drop query parameters
+			if idx := strings.Index(localPath, "?"); idx >= 0 {
+				localPath = localPath[:idx]
+			}
 
-		logger.Infof("Attempting to download session from GCS: gs://%s/%s", gcsBucket, gcsObjectName)
-		if err := downloadSessionFromGCS(context.Background(), gcsBucket, gcsObjectName, localPath, logger); err != nil {
-			logger.Warnf("Failed to download session from GCS (will start fresh): %v", err)
+			logger.Infof("Attempting to download session from GCS: gs://%s/%s", gcsBucket, gcsObjectName)
+			if err := downloadSessionFromGCS(context.Background(), gcsBucket, gcsObjectName, localPath, logger); err != nil {
+				logger.Warnf("Failed to download session from GCS (will start fresh): %v", err)
+			}
+		} else {
+			logger.Infof("GCS session backup is only supported for SQLite, skipping download (using Postgres)")
+			logger.Infof("For Postgres backup, use Supabase backups or pg_dump directly")
 		}
 	}
 
@@ -1695,21 +1843,25 @@ func main() {
 				isAuthenticated = true
 				authMutex.Unlock()
 
-				// Upload session to GCS after successful authentication
-				if gcsBucket != "" && sessionConfig.DriverName == "sqlite3" {
-					go func() {
-						// Extract local SQLite path from DSN
-						localPath := sessionConfig.DataSourceName
-						localPath = strings.TrimPrefix(localPath, "file:")
-						if idx := strings.Index(localPath, "?"); idx >= 0 {
-							localPath = localPath[:idx]
-						}
+				// Upload session to GCS after successful authentication (SQLite only)
+				if gcsBucket != "" {
+					if sessionConfig.DriverName == "sqlite3" {
+						go func() {
+							// Extract local SQLite path from DSN
+							localPath := sessionConfig.DataSourceName
+							localPath = strings.TrimPrefix(localPath, "file:")
+							if idx := strings.Index(localPath, "?"); idx >= 0 {
+								localPath = localPath[:idx]
+							}
 
-						logger.Infof("Uploading session to GCS after authentication")
-						if err := uploadSessionToGCS(context.Background(), gcsBucket, gcsObjectName, localPath, logger); err != nil {
-							logger.Errorf("Failed to upload session to GCS: %v", err)
-						}
-					}()
+							logger.Infof("Uploading session to GCS after authentication")
+							if err := uploadSessionToGCS(context.Background(), gcsBucket, gcsObjectName, localPath, logger); err != nil {
+								logger.Errorf("Failed to upload session to GCS: %v", err)
+							}
+						}()
+					} else {
+						logger.Infof("GCS session backup is only for SQLite, skipping upload (using Postgres)")
+					}
 				}
 
 				connected <- true
@@ -1739,21 +1891,25 @@ func main() {
 		isAuthenticated = true
 		authMutex.Unlock()
 
-		// Upload session to GCS on reconnect
-		if gcsBucket != "" && sessionConfig.DriverName == "sqlite3" {
-			go func() {
-				// Extract local SQLite path from DSN
-				localPath := sessionConfig.DataSourceName
-				localPath = strings.TrimPrefix(localPath, "file:")
-				if idx := strings.Index(localPath, "?"); idx >= 0 {
-					localPath = localPath[:idx]
-				}
+		// Upload session to GCS on reconnect (SQLite only)
+		if gcsBucket != "" {
+			if sessionConfig.DriverName == "sqlite3" {
+				go func() {
+					// Extract local SQLite path from DSN
+					localPath := sessionConfig.DataSourceName
+					localPath = strings.TrimPrefix(localPath, "file:")
+					if idx := strings.Index(localPath, "?"); idx >= 0 {
+						localPath = localPath[:idx]
+					}
 
-				logger.Infof("Uploading session to GCS after reconnect")
-				if err := uploadSessionToGCS(context.Background(), gcsBucket, gcsObjectName, localPath, logger); err != nil {
-					logger.Errorf("Failed to upload session to GCS: %v", err)
-				}
-			}()
+					logger.Infof("Uploading session to GCS after reconnect")
+					if err := uploadSessionToGCS(context.Background(), gcsBucket, gcsObjectName, localPath, logger); err != nil {
+						logger.Errorf("Failed to upload session to GCS: %v", err)
+					}
+				}()
+			} else {
+				logger.Infof("GCS session backup is only for SQLite, skipping upload (using Postgres)")
+			}
 		}
 
 		connected <- true

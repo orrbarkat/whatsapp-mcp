@@ -121,14 +121,36 @@ def check_api_health() -> bool:
         return False
 
 def check_authentication_status() -> Tuple[bool, Optional[str]]:
-    """Check if WhatsApp is authenticated by looking for session data."""
-    whatsapp_db_path = os.path.join(BRIDGE_DIR, 'store', 'whatsapp.db')
+    """Check if WhatsApp is authenticated.
 
-    if not os.path.exists(whatsapp_db_path):
-        return False, "No session database found"
+    First tries the bridge API for most accurate status, then falls back to
+    database checks. This works with both SQLite and Postgres session storage.
+    """
+    # Try bridge API first (most reliable)
+    try:
+        session = get_http_session()
+        response = session.get(f"{WHATSAPP_API_BASE_URL}/auth-status", timeout=DEFAULT_TIMEOUT)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("authenticated"):
+                return True, "Authenticated via bridge"
+            elif data.get("has_qr_code"):
+                return False, "QR code available for scanning"
+            else:
+                return False, "Not authenticated"
+    except requests.RequestException as e:
+        # Bridge not available, fall back to database check
+        pass
 
-    adapter = get_db_adapter()
-    return adapter.authentication.check_authentication_status()
+    # Fall back to database check if bridge API is unavailable
+    # This works with both SQLite and Postgres using the unified adapter
+    try:
+        from config import get_database_adapter
+        adapter = get_database_adapter()
+        return adapter.authentication.check_authentication_status()
+    except Exception as e:
+        # If database check also fails, assume not authenticated
+        return False, f"Unable to check authentication: {str(e)}"
 
 def monitor_bridge_output(process):
     """Monitor bridge process output for QR codes and status updates."""

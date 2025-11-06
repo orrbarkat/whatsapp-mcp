@@ -245,3 +245,26 @@ resource "google_secret_manager_secret_version" "oauth_client_secret" {
 
   secret_data = "your-oauth-client-secret"
 }
+
+# Secret Manager: Session Database DSN (optional - for Supabase session storage)
+resource "google_secret_manager_secret" "session_dsn" {
+  secret_id = "${var.secret_prefix}-session-dsn"
+  project   = var.project_id
+
+  replication {
+    auto {}
+  }
+
+  labels = var.labels
+
+  depends_on = [google_project_service.required_apis]
+}
+
+resource "google_secret_manager_secret_version" "session_dsn" {
+  secret = google_secret_manager_secret.session_dsn.id
+
+  # Placeholder value - update with actual Supabase Postgres DSN for session storage
+  # Example: postgresql://postgres:password@db.xxxxx.supabase.co:5432/postgres?sslmode=require
+  # Note: If not set, defaults to DATABASE_URL or local SQLite
+  secret_data = "postgresql://postgres:your-password@db.your-project.supabase.co:5432/postgres?sslmode=require"
+}

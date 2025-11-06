@@ -30,6 +30,29 @@ Creates the `chat_list` view that aggregates chat information with the most rece
 
 **Dependencies:** Requires `000_create_bridge_tables.sql` to be applied first.
 
+### 010_create_whatsmeow_session_tables.sql
+Creates all tables required by `go.mau.fi/whatsmeow/store/sqlstore` for storing WhatsApp session data in Postgres. This migration is **required** when using Postgres (including Supabase) as the session store backend.
+
+**Purpose:** Establishes the schema for whatsmeow's SQLite-compatible tables adapted for Postgres. Enables storing WhatsApp device sessions, encryption keys, contacts, and sync state in a centralized database instead of local SQLite files.
+
+**Tables Created:**
+- `devices`: WhatsApp device registration and keys
+- `identities`: Identity keys for other users
+- `prekeys`, `signed_prekeys`: Signal protocol pre-keys
+- `sessions`: Signal protocol sessions
+- `sender_keys`: Group message encryption keys
+- `app_state_sync_keys`, `app_state_version`, `app_state_mutation_macs`: Multi-device sync state
+- `contacts`: Contact information
+- `chat_settings`: Per-chat preferences (muted, pinned, archived)
+- `message_secrets`: Message encryption keys
+- `privacy_tokens`: Privacy feature tokens
+
+**Database Support:** PostgreSQL only (including Supabase). Uses `bytea` for binary data and `timestamptz` for timestamps.
+
+**Security:** Implements Row Level Security (RLS) with deny-all policies by default. Access is granted only to `service_role`, ensuring client-side SDKs cannot access sensitive session data. **The backend must use the Supabase service key** (not anon key) to access these tables.
+
+**Dependencies:** None. Can be applied independently of message tables. Run order: apply after `000_` and `001_` if using Supabase for both messages and sessions.
+
 ## How to Apply Migrations
 
 ### For SQLite (Local Development)
@@ -81,6 +104,9 @@ psql "postgresql://postgres:[YOUR-PASSWORD]@[YOUR-PROJECT-REF].supabase.co:5432/
 # Run migrations in order
 \i whatsapp-mcp-server/migrations/000_create_bridge_tables.sql
 \i whatsapp-mcp-server/migrations/001_create_chat_list_view.sql
+
+# If using Supabase for session storage (recommended):
+\i whatsapp-mcp-server/migrations/010_create_whatsmeow_session_tables.sql
 ```
 
 ## Verification
@@ -112,6 +138,38 @@ SELECT * FROM chat_list LIMIT 1;
 -- Verify PostgREST access (Supabase only)
 -- In your browser or API client:
 -- GET https://[YOUR-PROJECT-REF].supabase.co/rest/v1/chat_list
+```
+
+### Verify WhatsApp Session Tables (010_create_whatsmeow_session_tables.sql)
+
+```sql
+-- Check that the devices table exists (primary whatsmeow table)
+SELECT to_regclass('public.devices');
+-- Should return: "devices"
+
+-- Verify all session tables exist
+SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+AND tablename IN ('devices', 'identities', 'prekeys', 'sessions', 'sender_keys',
+                  'signed_prekeys', 'app_state_sync_keys', 'app_state_version',
+                  'app_state_mutation_macs', 'contacts', 'chat_settings',
+                  'message_secrets', 'privacy_tokens');
+-- Should return 13 rows
+
+-- Verify RLS is enabled (should show all tables with RLS on)
+SELECT tablename, rowsecurity FROM pg_tables
+WHERE schemaname = 'public' AND tablename LIKE '%'
+AND tablename IN ('devices', 'identities', 'prekeys', 'sessions');
+-- All should show rowsecurity = true
+
+-- Verify service_role has access (must be connected as service_role)
+SELECT grantee, privilege_type FROM information_schema.table_privileges
+WHERE table_name = 'devices' AND grantee = 'service_role';
+-- Should show SELECT, INSERT, UPDATE, DELETE
+
+-- Verify anon/authenticated do NOT have direct access (security check)
+SELECT grantee, privilege_type FROM information_schema.table_privileges
+WHERE table_name = 'devices' AND grantee IN ('anon', 'authenticated');
+-- Should return no rows (empty)
 ```
 
 ## View Schema

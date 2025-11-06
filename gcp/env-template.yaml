@@ -24,7 +24,8 @@ PORT: "3000"
 # Example: http://localhost:8080 (for local) or https://bridge-service-url.run.app
 WHATSAPP_BRIDGE_URL: "http://localhost:8080"
 
-# GCS Session Storage Configuration
+# GCS Session Storage Configuration (SQLite sessions only)
+# IMPORTANT: GCS backup is automatically DISABLED when using Postgres/Supabase for sessions
 # Bucket name for WhatsApp session backup (SQLite mode only)
 GCS_SESSION_BUCKET: "your-project-id-whatsapp-mcp-sessions"
 
@@ -38,7 +39,12 @@ OAUTH_ENABLED: "true"
 
 # Additional environment variables (if needed)
 # LOG_LEVEL: "INFO"
-# WHATSAPP_SESSION_DATABASE_URL: "sqlite:///path/to/session.db"
+
+# Database Configuration Notes:
+# - By default, uses SQLite for both messages and sessions
+# - For Postgres/Supabase, configure DATABASE_URL and/or WHATSAPP_SESSION_DATABASE_URL as secrets
+# - If WHATSAPP_SESSION_DATABASE_URL is not set, falls back to DATABASE_URL
+# - If neither is set, uses local SQLite files
 
 # ==========================================
 # Secrets (--update-secrets)
@@ -49,19 +55,37 @@ OAUTH_ENABLED: "true"
 # Use with gcloud run deploy:
 # --update-secrets=GOOGLE_CLIENT_ID=whatsapp-mcp-google-client-id:latest,OAUTH_AUDIENCE=whatsapp-mcp-oauth-audience:latest
 
-# Note: Server uses SQLite by default. For Supabase PostgreSQL, add:
-# --update-secrets=SUPABASE_URL=whatsapp-mcp-supabase-url:latest,SUPABASE_KEY=whatsapp-mcp-supabase-key:latest
+# Database Secrets (Optional - for Postgres/Supabase)
+# By default, uses SQLite. Configure these for Postgres/Supabase database storage.
+
+# DATABASE_URL (Optional)
+# Secret name: whatsapp-mcp-database-url
+# Value: Postgres connection string (e.g., postgresql://postgres:password@db.xxxxx.supabase.co:5432/postgres?sslmode=require)
+# Used for: Message history storage (Python MCP server and Go bridge)
+# Deployment flag: --update-secrets=DATABASE_URL=whatsapp-mcp-database-url:latest
+DATABASE_URL: "whatsapp-mcp-database-url:latest"
+
+# WHATSAPP_SESSION_DATABASE_URL (Optional)
+# Secret name: whatsapp-mcp-session-dsn
+# Value: Postgres connection string for session storage
+# Used for: WhatsApp session data (authentication, device keys, contacts)
+# Falls back to DATABASE_URL if not set
+# Requires migration: 010_create_whatsmeow_session_tables.sql
+# Deployment flag: --update-secrets=WHATSAPP_SESSION_DATABASE_URL=whatsapp-mcp-session-dsn:latest
+WHATSAPP_SESSION_DATABASE_URL: "whatsapp-mcp-session-dsn:latest"
 
 # SUPABASE_URL (Optional)
 # Secret name: whatsapp-mcp-supabase-url
 # Value: Your Supabase project URL (e.g., https://xxxxx.supabase.co)
-# Only required if using Supabase for database storage
+# Only required if using Supabase Python SDK features
+# Deployment flag: --update-secrets=SUPABASE_URL=whatsapp-mcp-supabase-url:latest
 SUPABASE_URL: "whatsapp-mcp-supabase-url:latest"
 
 # SUPABASE_KEY (Optional)
 # Secret name: whatsapp-mcp-supabase-key
-# Value: Your Supabase anon key or service role key
-# Only required if using Supabase for database storage
+# Value: Your Supabase service role key (for session tables, must use service key not anon key)
+# Only required if using Supabase Python SDK features
+# Deployment flag: --update-secrets=SUPABASE_KEY=whatsapp-mcp-supabase-key:latest
 SUPABASE_KEY: "whatsapp-mcp-supabase-key:latest"
 
 # OAuth Credentials (Required if OAUTH_ENABLED=true)
@@ -107,7 +131,9 @@ OAUTH_AUDIENCE: "whatsapp-mcp-oauth-audience:latest"
 #   --execution-environment=gen2 \
 #   --project=PROJECT_ID
 #
-# Optional: Add Supabase secrets if using Supabase for database:
+# Optional: Add database secrets if using Postgres/Supabase:
+#   --update-secrets=DATABASE_URL=whatsapp-mcp-database-url:latest,WHATSAPP_SESSION_DATABASE_URL=whatsapp-mcp-session-dsn:latest
+# Or add Supabase Python SDK secrets:
 #   --update-secrets=SUPABASE_URL=whatsapp-mcp-supabase-url:latest,SUPABASE_KEY=whatsapp-mcp-supabase-key:latest
 
 # Health Check Configuration
@@ -127,14 +153,25 @@ OAUTH_AUDIENCE: "whatsapp-mcp-oauth-audience:latest"
 # 1. Cloud Run uses Application Default Credentials (ADC) via the service account
 #    No need to set GOOGLE_APPLICATION_CREDENTIALS
 #
-# 2. Server uses SQLite by default (no database configuration required)
-#    For Supabase PostgreSQL, provide SUPABASE_URL and SUPABASE_KEY secrets
+# 2. Database Configuration:
+#    - Default: Uses SQLite for both messages and sessions (no configuration needed)
+#    - Messages: Set DATABASE_URL secret for Postgres/Supabase message storage
+#    - Sessions: Set WHATSAPP_SESSION_DATABASE_URL secret for Postgres/Supabase session storage
+#    - If WHATSAPP_SESSION_DATABASE_URL not set, falls back to DATABASE_URL
+#    - For Supabase Python SDK, also set SUPABASE_URL and SUPABASE_KEY
 #
-# 3. GCS session storage works with SQLite session databases
-#    Session data is stored in GCS bucket and synced automatically
+# 3. Session Storage Options:
+#    a) SQLite (default): GCS backup enabled, automatic sync
+#    b) Postgres/Supabase: GCS backup disabled, use Supabase backups or pg_dump
+#    - Requires migration: 010_create_whatsmeow_session_tables.sql
+#    - Must use Supabase service key (not anon key) for session tables
 #
 # 4. Create secrets before deployment:
 #    echo -n 'secret-value' | gcloud secrets create secret-name --data-file=- --project=PROJECT_ID
+#
+#    Example for session DSN:
+#    echo -n 'postgresql://postgres:password@db.xxxxx.supabase.co:5432/postgres?sslmode=require' | \
+#      gcloud secrets create whatsapp-mcp-session-dsn --data-file=- --project=PROJECT_ID
 #
 # 5. Update secret versions:
 #    echo -n 'new-value' | gcloud secrets versions add secret-name --data-file=- --project=PROJECT_ID
@@ -144,3 +181,12 @@ OAUTH_AUDIENCE: "whatsapp-mcp-oauth-audience:latest"
 #
 # 7. View logs:
 #    gcloud run services logs read whatsapp-mcp --region=us-central1 --project=PROJECT_ID
+#
+#    Check for session backend:
+#    - "Using Postgres session store" (if Postgres configured)
+#    - "Using SQLite session store" (if SQLite/default)
+#    - "GCS session backup is only for SQLite, skipping" (if Postgres sessions)
+#
+# 8. Check session backend status:
+#    curl https://[YOUR-SERVICE-URL]/api/session-backend
+#    Returns: backend type, tables validation, host info
