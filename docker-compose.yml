@@ -49,6 +49,12 @@ services:
       - MCP_TRANSPORT=${MCP_TRANSPORT:-sse}
       # MCP server port for SSE transport
       - MCP_PORT=3000
+      # Cloud Run compatibility: PORT env var
+      - PORT=3000
+      # OAuth configuration (optional for local testing)
+      - OAUTH_ENABLED=${OAUTH_ENABLED:-false}
+      # - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      # - OAUTH_AUDIENCE=${OAUTH_AUDIENCE}
       # Bridge API URL (localhost since both services are in same container)
       - WHATSAPP_BRIDGE_URL=http://localhost:8080
     # Uncomment to wait for PostgreSQL to be ready before starting
@@ -56,10 +62,11 @@ services:
     #   postgres:
     #     condition: service_healthy
     restart: unless-stopped
+    # Health check using the /health endpoint (same as Cloud Run)
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/", "||", "exit", "1"]
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:$$PORT/health || exit 1"]
       interval: 30s
-      timeout: 10s
+      timeout: 3s
       retries: 3
       start_period: 40s
 

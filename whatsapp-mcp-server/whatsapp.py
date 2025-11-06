@@ -1,7 +1,10 @@
 from datetime import datetime
 from typing import Optional, List, Tuple
-import os.path
+import os
+import atexit
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import json
 import audio
 import subprocess
@@ -21,6 +24,29 @@ BRIDGE_EXECUTABLE = "whatsapp-bridge"
 BRIDGE_PROCESS = None
 BRIDGE_OUTPUT_QUEUE = queue.Queue()
 QR_CODE_DATA = None
+
+# Configure HTTP session with retries and timeouts
+_http_session = None
+
+def get_http_session() -> requests.Session:
+    """Get or create HTTP session with retries and timeouts configured."""
+    global _http_session
+    if _http_session is None:
+        _http_session = requests.Session()
+        # Configure retry strategy: 3 retries, backoff factor of 0.3s
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "POST", "OPTIONS"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        _http_session.mount("http://", adapter)
+        _http_session.mount("https://", adapter)
+    return _http_session
+
+# Default timeout: 3s connect, 15s read
+DEFAULT_TIMEOUT = (3, 15)
 
 # Initialize database adapter
 _db_adapter: Optional[SQLiteDatabaseAdapter] = None
@@ -88,8 +114,9 @@ def is_bridge_process_running() -> bool:
 def check_api_health() -> bool:
     """Check if the bridge API is responsive."""
     try:
-        response = requests.get(f"{WHATSAPP_API_BASE_URL.replace('/api', '')}/", timeout=5)
-        return response.status_code in [200, 404]  # 404 is OK, means server is running
+        session = get_http_session()
+        response = session.get(f"{WHATSAPP_API_BASE_URL.replace('/api', '')}/health", timeout=DEFAULT_TIMEOUT)
+        return response.status_code == 200
     except requests.RequestException:
         return False
 
@@ -151,6 +178,7 @@ def start_bridge_process() -> Tuple[bool, str]:
         os.chmod(executable_path, 0o755)
 
         # Start the process
+        # Start in a new session for proper signal handling in Cloud Run
         BRIDGE_PROCESS = subprocess.Popen(
             [executable_path],
             cwd=bridge_path,
@@ -158,6 +186,7 @@ def start_bridge_process() -> Tuple[bool, str]:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
         
         # Start output monitoring in a separate thread
@@ -179,18 +208,38 @@ def start_bridge_process() -> Tuple[bool, str]:
 def stop_bridge_process() -> bool:
     """Stop the WhatsApp bridge process."""
     global BRIDGE_PROCESS
-    
     if BRIDGE_PROCESS:
         try:
-            BRIDGE_PROCESS.terminate()
-            BRIDGE_PROCESS.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            BRIDGE_PROCESS.kill()
-        except Exception:
-            pass
+            pid = BRIDGE_PROCESS.pid
+            # Try to signal the process group first
+            try:
+                pgid = os.getpgid(pid)
+                print("Sending SIGTERM to bridge process group...", flush=True)
+                os.killpg(pgid, signal.SIGTERM)
+            except Exception:
+                # Fallback to terminating the process directly
+                try:
+                    BRIDGE_PROCESS.terminate()
+                except Exception:
+                    pass
+
+            try:
+                BRIDGE_PROCESS.wait(timeout=10)
+                print("Bridge process terminated gracefully", flush=True)
+            except subprocess.TimeoutExpired:
+                print("Bridge did not exit in time; sending SIGKILL...", flush=True)
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        BRIDGE_PROCESS.kill()
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Error stopping bridge process: {e}", flush=True)
         finally:
             BRIDGE_PROCESS = None
-    
+
     return True
 
 def wait_for_authentication(timeout: int = 120) -> Tuple[bool, Optional[str]]:
@@ -479,22 +528,25 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
-        
-        response = requests.post(url, json=payload)
-        
+
+        session = get_http_session()
+        response = session.post(url, json=payload, timeout=DEFAULT_TIMEOUT)
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
+    except requests.Timeout:
+        return False, "Request timed out. The bridge may be unresponsive."
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -507,28 +559,31 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         if not media_path:
             return False, "Media path must be provided"
-        
+
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
-        
-        response = requests.post(url, json=payload)
-        
+
+        session = get_http_session()
+        response = session.post(url, json=payload, timeout=DEFAULT_TIMEOUT)
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
+    except requests.Timeout:
+        return False, "Request timed out. The bridge may be unresponsive."
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -559,16 +614,19 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             "recipient": recipient,
             "media_path": media_path
         }
-        
-        response = requests.post(url, json=payload)
-        
+
+        session = get_http_session()
+        response = session.post(url, json=payload, timeout=DEFAULT_TIMEOUT)
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
+    except requests.Timeout:
+        return False, "Request timed out. The bridge may be unresponsive."
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -592,9 +650,10 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "message_id": message_id,
             "chat_jid": chat_jid
         }
-        
-        response = requests.post(url, json=payload)
-        
+
+        session = get_http_session()
+        response = session.post(url, json=payload, timeout=DEFAULT_TIMEOUT)
+
         if response.status_code == 200:
             result = response.json()
             if result.get("success", False):
@@ -607,7 +666,10 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
         else:
             print(f"Error: HTTP {response.status_code} - {response.text}")
             return None
-            
+
+    except requests.Timeout:
+        print("Request timed out. The bridge may be unresponsive.")
+        return None
     except requests.RequestException as e:
         print(f"Request error: {str(e)}")
         return None
@@ -617,3 +679,7 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+# Ensure bridge is stopped when the Python process exits
+atexit.register(stop_bridge_process)

@@ -6,3 +6,22 @@ claude_desktop_config.json
 *.log
 *.pid
 qr_codes
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!terraform.tfvars.example
+*.tfplan
+*.tfplan.*
+crash.log
+crash.*.log
+
+# GCP
+gcp/*.json
+gcp/service-account-key.json
+gcp/**/*.json
+gcp/generated-env.yaml
+gcp/.gcloud/

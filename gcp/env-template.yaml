@@ -1,0 +1,146 @@
+# Cloud Run Environment Configuration Template
+# This file documents the environment variables and secrets for Cloud Run deployment
+
+# ==========================================
+# Environment Variables (--set-env-vars)
+# ==========================================
+
+# MCP Transport Configuration
+# Required: Set to 'sse' for Server-Sent Events (HTTP-based)
+MCP_TRANSPORT: "sse"
+
+# MCP Server Port
+# Cloud Run injects PORT environment variable (default 8080)
+# We explicitly set MCP_PORT to 3000 to match our application's expected port
+MCP_PORT: "3000"
+
+# Cloud Run PORT (explicitly set to match containerPort)
+# This is normally injected by Cloud Run, but we set it explicitly
+# to ensure consistency with the service definition
+PORT: "3000"
+
+# WhatsApp Bridge URL
+# URL of the Go bridge service (can be same Cloud Run service on different port, or separate service)
+# Example: http://localhost:8080 (for local) or https://bridge-service-url.run.app
+WHATSAPP_BRIDGE_URL: "http://localhost:8080"
+
+# GCS Session Storage Configuration
+# Bucket name for WhatsApp session backup (SQLite mode only)
+GCS_SESSION_BUCKET: "your-project-id-whatsapp-mcp-sessions"
+
+# Object name for session database in GCS
+GCS_SESSION_OBJECT_NAME: "whatsapp.db"
+
+# OAuth Configuration
+# Set to "true" to enable OAuth authentication (recommended for production)
+# Set to "false" for local development or testing
+OAUTH_ENABLED: "true"
+
+# Additional environment variables (if needed)
+# LOG_LEVEL: "INFO"
+# WHATSAPP_SESSION_DATABASE_URL: "sqlite:///path/to/session.db"
+
+# ==========================================
+# Secrets (--update-secrets)
+# ==========================================
+# Secrets should be created in Secret Manager and mounted as environment variables
+# Format: ENV_VAR_NAME=secret-name:version
+#
+# Use with gcloud run deploy:
+# --update-secrets=GOOGLE_CLIENT_ID=whatsapp-mcp-google-client-id:latest,OAUTH_AUDIENCE=whatsapp-mcp-oauth-audience:latest
+
+# Note: Server uses SQLite by default. For Supabase PostgreSQL, add:
+# --update-secrets=SUPABASE_URL=whatsapp-mcp-supabase-url:latest,SUPABASE_KEY=whatsapp-mcp-supabase-key:latest
+
+# SUPABASE_URL (Optional)
+# Secret name: whatsapp-mcp-supabase-url
+# Value: Your Supabase project URL (e.g., https://xxxxx.supabase.co)
+# Only required if using Supabase for database storage
+SUPABASE_URL: "whatsapp-mcp-supabase-url:latest"
+
+# SUPABASE_KEY (Optional)
+# Secret name: whatsapp-mcp-supabase-key
+# Value: Your Supabase anon key or service role key
+# Only required if using Supabase for database storage
+SUPABASE_KEY: "whatsapp-mcp-supabase-key:latest"
+
+# OAuth Credentials (Required if OAUTH_ENABLED=true)
+# GOOGLE_CLIENT_ID
+# Secret name: whatsapp-mcp-google-client-id
+# Format: YOUR_CLIENT_ID.apps.googleusercontent.com
+GOOGLE_CLIENT_ID: "whatsapp-mcp-google-client-id:latest"
+
+# OAUTH_AUDIENCE
+# Secret name: whatsapp-mcp-oauth-audience
+# Should match the Google OAuth Client ID for Google ID tokens
+# Format: YOUR_CLIENT_ID.apps.googleusercontent.com
+OAUTH_AUDIENCE: "whatsapp-mcp-oauth-audience:latest"
+
+# ==========================================
+# Service Account Configuration
+# ==========================================
+# Use service account with the following roles:
+# - roles/secretmanager.secretAccessor (for reading secrets)
+# - roles/storage.objectAdmin (for GCS bucket access, applied at bucket level)
+# - roles/run.invoker (if using authenticated access)
+#
+# Set with: --service-account=whatsapp-mcp-sa@PROJECT_ID.iam.gserviceaccount.com
+
+# ==========================================
+# Complete Deployment Command Example
+# ==========================================
+# gcloud run deploy whatsapp-mcp \
+#   --image=REGION-docker.pkg.dev/PROJECT_ID/REPO_NAME/whatsapp-mcp:TAG \
+#   --region=REGION \
+#   --platform=managed \
+#   --allow-unauthenticated \
+#   --service-account=SERVICE_ACCOUNT_EMAIL \
+#   --update-secrets=GOOGLE_CLIENT_ID=whatsapp-mcp-google-client-id:latest,OAUTH_AUDIENCE=whatsapp-mcp-oauth-audience:latest \
+#   --set-env-vars=MCP_TRANSPORT=sse,PORT=3000,MCP_PORT=3000,WHATSAPP_BRIDGE_URL=http://localhost:8080,GCS_SESSION_BUCKET=PROJECT_ID-whatsapp-sessions,GCS_SESSION_OBJECT_NAME=whatsapp.db,OAUTH_ENABLED=true \
+#   --port=3000 \
+#   --cpu=2 \
+#   --memory=2Gi \
+#   --timeout=300 \
+#   --max-instances=10 \
+#   --min-instances=0 \
+#   --no-cpu-throttling \
+#   --execution-environment=gen2 \
+#   --project=PROJECT_ID
+#
+# Optional: Add Supabase secrets if using Supabase for database:
+#   --update-secrets=SUPABASE_URL=whatsapp-mcp-supabase-url:latest,SUPABASE_KEY=whatsapp-mcp-supabase-key:latest
+
+# Health Check Configuration
+# ==========================
+# The /health endpoint is automatically available and does not require authentication
+# It bypasses OAuth authentication and returns 200 OK for Cloud Run health checks
+#
+# Cloud Run health check settings (configured in cloudrun.yaml):
+# - Startup probe: /health endpoint, 10s initial delay, 10s period, 3 failures
+# - Liveness probe: /health endpoint, 30s initial delay, 30s period, 3 failures
+#
+# Test locally: curl http://localhost:3000/health
+
+# ==========================================
+# Notes
+# ==========================================
+# 1. Cloud Run uses Application Default Credentials (ADC) via the service account
+#    No need to set GOOGLE_APPLICATION_CREDENTIALS
+#
+# 2. Server uses SQLite by default (no database configuration required)
+#    For Supabase PostgreSQL, provide SUPABASE_URL and SUPABASE_KEY secrets
+#
+# 3. GCS session storage works with SQLite session databases
+#    Session data is stored in GCS bucket and synced automatically
+#
+# 4. Create secrets before deployment:
+#    echo -n 'secret-value' | gcloud secrets create secret-name --data-file=- --project=PROJECT_ID
+#
+# 5. Update secret versions:
+#    echo -n 'new-value' | gcloud secrets versions add secret-name --data-file=- --project=PROJECT_ID
+#
+# 6. Verify deployment:
+#    gcloud run services describe whatsapp-mcp --region=us-central1 --project=PROJECT_ID
+#
+# 7. View logs:
+#    gcloud run services logs read whatsapp-mcp --region=us-central1 --project=PROJECT_ID

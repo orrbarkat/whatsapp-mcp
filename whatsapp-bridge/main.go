@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -25,6 +26,7 @@ import (
 
 	"bytes"
 
+	"cloud.google.com/go/storage"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -36,10 +38,10 @@ import (
 
 // Global variables for QR code state management
 var (
-	currentQRCode string
+	currentQRCode   string
 	isAuthenticated bool
-	authMutex sync.RWMutex
-	lastQRUpdate time.Time
+	authMutex       sync.RWMutex
+	lastQRUpdate    time.Time
 )
 
 // Message represents a chat message for our client
@@ -72,7 +74,9 @@ func getDatabaseConfig(envVar string, defaultDriver string, defaultDSN string) D
 
 	// Parse DATABASE_URL
 	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {
-		// PostgreSQL connection string
+		// PostgreSQL connection string - use original URL directly
+		// lib/pq handles postgres:// and postgresql:// URLs natively
+		// This preserves all query parameters including sslmode, timeouts, etc.
 		return DatabaseConfig{
 			DriverName:     "postgres",
 			DataSourceName: databaseURL,
@@ -91,6 +95,101 @@ func getDatabaseConfig(envVar string, defaultDriver string, defaultDSN string) D
 		DriverName:     "sqlite3",
 		DataSourceName: databaseURL,
 	}
+}
+
+// downloadSessionFromGCS downloads a session database from Google Cloud Storage
+func downloadSessionFromGCS(ctx context.Context, bucketName, objectName, localPath string, logger waLog.Logger) error {
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create GCS client: %v", err)
+	}
+	defer client.Close()
+
+	bucket := client.Bucket(bucketName)
+	obj := bucket.Object(objectName)
+
+	// Check if object exists
+	_, err = obj.Attrs(ctx)
+	if err == storage.ErrObjectNotExist {
+		logger.Infof("No prior session found in GCS: gs://%s/%s", bucketName, objectName)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to check object existence: %v", err)
+	}
+
+	// Create local directory if needed
+	localDir := filepath.Dir(localPath)
+	if err := os.MkdirAll(localDir, 0755); err != nil {
+		return fmt.Errorf("failed to create local directory: %v", err)
+	}
+
+	// Create local file
+	localFile, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to create local file: %v", err)
+	}
+	defer localFile.Close()
+
+	// Download object
+	reader, err := obj.NewReader(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create reader: %v", err)
+	}
+	defer reader.Close()
+
+	if _, err := io.Copy(localFile, reader); err != nil {
+		return fmt.Errorf("failed to download object: %v", err)
+	}
+
+	logger.Infof("Successfully downloaded session from gs://%s/%s to %s", bucketName, objectName, localPath)
+	return nil
+}
+
+// uploadSessionToGCS uploads a session database to Google Cloud Storage
+func uploadSessionToGCS(ctx context.Context, bucketName, objectName, localPath string, logger waLog.Logger) error {
+	// Check if local file exists
+	if _, err := os.Stat(localPath); os.IsNotExist(err) {
+		logger.Infof("Local file does not exist, skipping upload: %s", localPath)
+		return nil
+	}
+
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create GCS client: %v", err)
+	}
+	defer client.Close()
+
+	// Open local file
+	localFile, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to open local file: %v", err)
+	}
+	defer localFile.Close()
+
+	// Create context with timeout
+	uploadCtx, cancel := context.WithTimeout(ctx, 50*time.Second)
+	defer cancel()
+
+	// Create writer
+	bucket := client.Bucket(bucketName)
+	obj := bucket.Object(objectName)
+	writer := obj.NewWriter(uploadCtx)
+	writer.ContentType = "application/x-sqlite3"
+
+	// Copy file to GCS
+	if _, err := io.Copy(writer, localFile); err != nil {
+		writer.Close()
+		return fmt.Errorf("failed to upload: %v", err)
+	}
+
+	// Close writer to finalize upload
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("failed to finalize upload: %v", err)
+	}
+
+	logger.Infof("Successfully uploaded session to gs://%s/%s", bucketName, objectName)
+	return nil
 }
 
 // Database handler for storing message history
@@ -119,47 +218,65 @@ func NewMessageStore() (*MessageStore, error) {
 
 	fmt.Printf("Message store using driver: %s\n", config.DriverName)
 
-	// Determine dialect-sensitive types
-	var blobType, intType string
-	if config.DriverName == "postgres" {
-		blobType = "BYTEA"
-		intType = "BIGINT"
-	} else {
-		blobType = "BLOB"
-		intType = "INTEGER"
+	// Verify database connection
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to connect to database: %v", err)
 	}
 
-	// Create tables with dialect-specific types
-	createTablesSQL := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS chats (
-			jid TEXT PRIMARY KEY,
-			name TEXT,
-			last_message_time TIMESTAMP
-		);
+	// Validate that required tables exist
+	var missingTables []string
 
-		CREATE TABLE IF NOT EXISTS messages (
-			id TEXT,
-			chat_jid TEXT,
-			sender TEXT,
-			content TEXT,
-			timestamp TIMESTAMP,
-			is_from_me BOOLEAN,
-			media_type TEXT,
-			filename TEXT,
-			url TEXT,
-			media_key %s,
-			file_sha256 %s,
-			file_enc_sha256 %s,
-			file_length %s,
-			PRIMARY KEY (id, chat_jid),
-			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
-		);
-	`, blobType, blobType, blobType, intType)
+	if config.DriverName == "postgres" {
+		// For PostgreSQL, use to_regclass with explicit schema to check table existence
+		// This ensures we check the public schema regardless of search_path settings
+		var chatsExists, messagesExists bool
 
-	_, err = db.Exec(createTablesSQL)
-	if err != nil {
+		err = db.QueryRow("SELECT to_regclass('public.chats') IS NOT NULL").Scan(&chatsExists)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to validate database schema: %v", err)
+		}
+
+		err = db.QueryRow("SELECT to_regclass('public.messages') IS NOT NULL").Scan(&messagesExists)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to validate database schema: %v", err)
+		}
+
+		if !chatsExists {
+			missingTables = append(missingTables, "chats")
+		}
+		if !messagesExists {
+			missingTables = append(missingTables, "messages")
+		}
+	} else {
+		// For SQLite, query sqlite_master
+		var chatsCount, messagesCount int
+
+		err = db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chats'").Scan(&chatsCount)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to validate database schema: %v", err)
+		}
+
+		err = db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages'").Scan(&messagesCount)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to validate database schema: %v", err)
+		}
+
+		if chatsCount == 0 {
+			missingTables = append(missingTables, "chats")
+		}
+		if messagesCount == 0 {
+			missingTables = append(missingTables, "messages")
+		}
+	}
+
+	if len(missingTables) > 0 {
 		db.Close()
-		return nil, fmt.Errorf("failed to create tables: %v", err)
+		return nil, fmt.Errorf("required tables missing: %v. The schema must be created externally", missingTables)
 	}
 
 	return &MessageStore{db: db, driverName: config.DriverName}, nil
@@ -811,6 +928,20 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Handler for health check
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Simple health check - return 200 OK
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -1291,7 +1422,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		escapedQR = strings.ReplaceAll(escapedQR, `"`, `\"`)
 		escapedQR = strings.ReplaceAll(escapedQR, "\n", "\\n")
 		escapedQR = strings.ReplaceAll(escapedQR, "\r", "\\r")
-		
+
 		data := struct {
 			QRCode string
 		}{
@@ -1312,30 +1443,30 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	// Handler for status API (for dashboard JS)
 	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		
+
 		authMutex.RLock()
 		authenticated := isAuthenticated
 		qrCode := currentQRCode
 		authMutex.RUnlock()
-		
+
 		// Get database stats
 		var msgCount, chatCount int64
 		var lastSyncTime *time.Time
 		var dbSize int64
-		
+
 		if messageStore != nil {
 			// Get message count
 			err := messageStore.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&msgCount)
 			if err != nil {
 				msgCount = 0
 			}
-			
+
 			// Get chat count
 			err = messageStore.db.QueryRow("SELECT COUNT(*) FROM chats").Scan(&chatCount)
 			if err != nil {
 				chatCount = 0
 			}
-			
+
 			// Get last message time
 			var lastMsg string
 			err = messageStore.db.QueryRow("SELECT MAX(timestamp) FROM messages").Scan(&lastMsg)
@@ -1344,39 +1475,39 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 					lastSyncTime = &t
 				}
 			}
-			
+
 			// Get database file size
 			if info, err := os.Stat("store/messages.db"); err == nil {
 				dbSize = info.Size()
 			}
 		}
-		
+
 		status := map[string]interface{}{
 			"sync_status": map[string]interface{}{
-				"active": authenticated && client.IsConnected(),
+				"active":        authenticated && client.IsConnected(),
 				"authenticated": authenticated,
-				"connected": client.IsConnected(),
+				"connected":     client.IsConnected(),
 			},
 			"bridge_status": map[string]interface{}{
-				"running": true,
-				"authenticated": authenticated,
+				"running":        true,
+				"authenticated":  authenticated,
 				"api_responsive": true,
 			},
 			"statistics": map[string]interface{}{
-				"message_count": msgCount,
-				"chat_count": chatCount,
-				"last_sync_time": lastSyncTime,
+				"message_count":    msgCount,
+				"chat_count":       chatCount,
+				"last_sync_time":   lastSyncTime,
 				"database_size_mb": float64(dbSize) / (1024 * 1024),
-				"database_exists": true,
+				"database_exists":  true,
 			},
 			"authentication": map[string]interface{}{
 				"has_qr_code": qrCode != "",
-				"qr_url": "http://localhost:8080/qr",
+				"qr_url":      "http://localhost:8080/qr",
 			},
 			"last_check": time.Now(),
-			"error": nil,
+			"error":      nil,
 		}
-		
+
 		json.NewEncoder(w).Encode(status)
 	})
 
@@ -1432,6 +1563,29 @@ func main() {
 		if err := os.MkdirAll("store", 0755); err != nil {
 			logger.Errorf("Failed to create store directory: %v", err)
 			return
+		}
+	}
+
+	// Download session from GCS if configured (before initializing sqlstore)
+	gcsBucket := os.Getenv("GCS_SESSION_BUCKET")
+	gcsObjectName := os.Getenv("GCS_SESSION_OBJECT_NAME")
+	if gcsObjectName == "" {
+		gcsObjectName = "whatsapp.db"
+	}
+
+	if gcsBucket != "" && sessionConfig.DriverName == "sqlite3" {
+		// Extract local SQLite path from DSN
+		localPath := sessionConfig.DataSourceName
+		// Trim "file:" prefix if present
+		localPath = strings.TrimPrefix(localPath, "file:")
+		// Drop query parameters
+		if idx := strings.Index(localPath, "?"); idx >= 0 {
+			localPath = localPath[:idx]
+		}
+
+		logger.Infof("Attempting to download session from GCS: gs://%s/%s", gcsBucket, gcsObjectName)
+		if err := downloadSessionFromGCS(context.Background(), gcsBucket, gcsObjectName, localPath, logger); err != nil {
+			logger.Warnf("Failed to download session from GCS (will start fresh): %v", err)
 		}
 	}
 
@@ -1520,12 +1674,12 @@ func main() {
 						currentQRCode = evt.Code
 						isAuthenticated = false
 						lastQRUpdate = time.Now()
-						
+
 						// Debug: Print raw QR code to see what it contains
 						fmt.Printf("DEBUG - Raw QR Code: %q\n", evt.Code)
-						
+
 						authMutex.Unlock()
-						
+
 						fmt.Println("\nScan this QR code with your WhatsApp app:")
 						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 						fmt.Printf("\nQR Code is also available at: http://localhost:8080/qr\n")
@@ -1540,7 +1694,24 @@ func main() {
 				currentQRCode = ""
 				isAuthenticated = true
 				authMutex.Unlock()
-				
+
+				// Upload session to GCS after successful authentication
+				if gcsBucket != "" && sessionConfig.DriverName == "sqlite3" {
+					go func() {
+						// Extract local SQLite path from DSN
+						localPath := sessionConfig.DataSourceName
+						localPath = strings.TrimPrefix(localPath, "file:")
+						if idx := strings.Index(localPath, "?"); idx >= 0 {
+							localPath = localPath[:idx]
+						}
+
+						logger.Infof("Uploading session to GCS after authentication")
+						if err := uploadSessionToGCS(context.Background(), gcsBucket, gcsObjectName, localPath, logger); err != nil {
+							logger.Errorf("Failed to upload session to GCS: %v", err)
+						}
+					}()
+				}
+
 				connected <- true
 				break
 			}
@@ -1561,13 +1732,30 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		
+
 		// Update authentication state for already logged in users
 		authMutex.Lock()
 		currentQRCode = ""
 		isAuthenticated = true
 		authMutex.Unlock()
-		
+
+		// Upload session to GCS on reconnect
+		if gcsBucket != "" && sessionConfig.DriverName == "sqlite3" {
+			go func() {
+				// Extract local SQLite path from DSN
+				localPath := sessionConfig.DataSourceName
+				localPath = strings.TrimPrefix(localPath, "file:")
+				if idx := strings.Index(localPath, "?"); idx >= 0 {
+					localPath = localPath[:idx]
+				}
+
+				logger.Infof("Uploading session to GCS after reconnect")
+				if err := uploadSessionToGCS(context.Background(), gcsBucket, gcsObjectName, localPath, logger); err != nil {
+					logger.Errorf("Failed to upload session to GCS: %v", err)
+				}
+			}()
+		}
+
 		connected <- true
 	}
 

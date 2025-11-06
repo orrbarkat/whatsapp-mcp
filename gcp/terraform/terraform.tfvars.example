@@ -1,0 +1,60 @@
+# WhatsApp MCP Terraform Configuration
+# Copy this file to terraform.tfvars and fill in your values
+
+# REQUIRED: Your GCP Project ID
+project_id = "your-gcp-project-id"
+
+# REQUIRED: GCS bucket name (must be globally unique)
+# If not specified, defaults to: {project_id}-whatsapp-mcp-sessions
+bucket_name = "your-unique-bucket-name"
+
+# Optional: GCP region (default: us-central1)
+region = "us-central1"
+
+# Optional: Cloud SQL instance name (default: whatsapp-mcp-db)
+db_instance_name = "whatsapp-mcp-db"
+
+# Optional: Database name (default: whatsapp_mcp)
+db_name = "whatsapp_mcp"
+
+# Optional: Database user name (default: whatsapp_user)
+db_user = "whatsapp_user"
+
+# Optional: Cloud SQL tier (default: db-f1-micro)
+# Options: db-f1-micro (shared CPU), db-g1-small, db-custom-1-3840, etc.
+# See: https://cloud.google.com/sql/pricing#pg-pricing
+db_tier = "db-f1-micro"
+
+# Optional: PostgreSQL version (default: POSTGRES_15)
+# Options: POSTGRES_15, POSTGRES_14, POSTGRES_13, etc.
+db_version = "POSTGRES_15"
+
+# Optional: Database disk size in GB (default: 10)
+db_disk_size_gb = 10
+
+# Optional: GCS bucket location (default: US)
+# Options: US, EU, ASIA, or specific region like us-central1
+bucket_location = "US"
+
+# Optional: Service account name (default: whatsapp-mcp-sa)
+service_account_name = "whatsapp-mcp-sa"
+
+# Optional: Prefix for Secret Manager secrets (default: whatsapp-mcp)
+secret_prefix = "whatsapp-mcp"
+
+# Optional: Enable automated backups (default: true)
+enable_backup = true
+
+# Optional: Backup start time in HH:MM UTC format (default: 03:00)
+backup_start_time = "03:00"
+
+# Optional: Enable private IP for Cloud SQL (default: false)
+# Requires VPC setup and service networking API
+enable_private_ip = false
+
+# Optional: Labels to apply to resources
+labels = {
+  application = "whatsapp-mcp"
+  managed-by  = "terraform"
+  environment = "production"
+}

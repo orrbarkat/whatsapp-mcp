@@ -16,14 +16,14 @@ SELECT
     c.jid,
     c.name,
     c.last_message_time,
-    m.text AS last_message,
+    m.content AS last_message,
     m.sender AS last_sender,
-    m.from_me AS last_is_from_me
+    m.is_from_me AS last_is_from_me
 FROM
-    whatsmeow_chats c
+    chats c
 LEFT JOIN
-    whatsmeow_history_messages m
-    ON c.jid = m.chat
+    messages m
+    ON c.jid = m.chat_jid
     AND c.last_message_time = m.timestamp;
 
 -- Grant permissions for PostgREST access
@@ -32,13 +32,11 @@ LEFT JOIN
 GRANT SELECT ON chat_list TO anon;
 GRANT SELECT ON chat_list TO authenticated;
 
--- Create an index on the underlying tables if not already present
--- to optimize the view queries (optional, but recommended for performance)
-CREATE INDEX IF NOT EXISTS idx_chats_last_message_time
-    ON whatsmeow_chats(last_message_time DESC);
-
-CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp
-    ON whatsmeow_history_messages(chat, timestamp DESC);
+-- Note: Indexes are created by the base migration (000_create_bridge_tables.sql)
+-- These indexes optimize the view queries:
+-- - idx_chats_last_message_time on chats(last_message_time DESC)
+-- - idx_messages_chat_timestamp on messages(chat_jid, timestamp DESC)
+-- No need to recreate them here.
 
 -- Notes for deployment:
 -- 1. Run this SQL in your Supabase SQL Editor or via migration tool

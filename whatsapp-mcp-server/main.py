@@ -2,6 +2,14 @@ from typing import List, Dict, Any, Optional
 import json
 from datetime import datetime
 from fastmcp import FastMCP
+import signal
+import atexit
+import sys
+
+# Starlette for mounting public health endpoint alongside the protected SSE app
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.responses import Response
 
 # MCP-UI SDK is currently only available for TypeScript/Node.js and Ruby
 # Python implementation doesn't exist yet, so we'll use HTML-based MCP resources
@@ -19,6 +27,7 @@ from whatsapp import (
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media,
     ensure_bridge_ready,
+    stop_bridge_process,
     get_bridge_status,
     format_messages_list,
     format_message,
@@ -30,6 +39,26 @@ import os
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
+
+
+async def health_check(request):
+    """Health check endpoint for Cloud Run. Returns 200 OK without authentication."""
+    return Response("OK", status_code=200, media_type="text/plain")
+
+
+# Shutdown flag for graceful termination
+_shutdown_flag = False
+
+def handle_shutdown_signal(signum, frame):
+    """Handle SIGTERM from Cloud Run for graceful shutdown."""
+    global _shutdown_flag
+    print(f"Received shutdown signal {signum}, initiating graceful shutdown...", flush=True)
+    _shutdown_flag = True
+    try:
+        stop_bridge_process()
+    except Exception as e:
+        print(f"Error stopping bridge during shutdown: {e}", flush=True)
+    # Do not call sys.exit() here - let uvicorn handle graceful shutdown
 
 def with_bridge_check(func):
     """Decorator to ensure bridge is ready before executing MCP tools."""
@@ -600,24 +629,84 @@ def check_bridge_status() -> Dict[str, Any]:
 if __name__ == "__main__":
     # Get transport mode from environment variable
     # Default to 'stdio' for backward compatibility with local installations
-    # Docker environments should set MCP_TRANSPORT=sse
+    # Docker/Cloud Run environments should set MCP_TRANSPORT=sse
     transport_mode = os.environ.get('MCP_TRANSPORT', 'stdio')
-    
+
     # Validate transport mode
     valid_transports = ['stdio', 'sse']
     if transport_mode not in valid_transports:
         print(f"Warning: Invalid MCP_TRANSPORT '{transport_mode}', defaulting to 'stdio'")
         transport_mode = 'stdio'
-    
+
     print(f"Starting WhatsApp MCP server with {transport_mode} transport...")
-    
+
+    # Register signal handlers for graceful shutdown before initializing bridge
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
+    atexit.register(lambda: stop_bridge_process())
+    print("Signal handlers registered for graceful shutdown", flush=True)
+
     initialize_bridge()
-    
+
     # Initialize and run the server
     if transport_mode == 'sse':
-        # For SSE transport, specify port 3000 to avoid conflicts
-        port = int(os.environ.get('MCP_PORT', 3000))
-        print(f"SSE transport listening on port {port}")
-    
-    # Initialize and run the server
-    mcp.run(transport=transport_mode, host="127.0.0.1", port=port)
+        import uvicorn
+        from auth_middleware import OAuth2BearerMiddleware
+
+        # Respect Cloud Run's PORT env var, then MCP_PORT, then default 3000
+        port = int(os.environ.get('PORT', os.environ.get('MCP_PORT', '3000')))
+
+        # Load OAuth configuration from environment
+        GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
+        OAUTH_PROVIDER = os.environ.get('OAUTH_PROVIDER', 'google')  # Default to 'google'
+        OAUTH_ENABLED = os.environ.get('OAUTH_ENABLED', 'true').lower() == 'true'
+
+        if OAUTH_ENABLED and not GOOGLE_CLIENT_ID:
+            print("[WARNING] OAuth enabled but GOOGLE_CLIENT_ID missing. Disabling OAuth.")
+            OAUTH_ENABLED = False
+
+        # For Google ID tokens, OAUTH_AUDIENCE must equal GOOGLE_CLIENT_ID
+        # Reject configs where OAUTH_AUDIENCE is set but diverges from GOOGLE_CLIENT_ID
+        OAUTH_AUDIENCE = os.environ.get('OAUTH_AUDIENCE', '')
+        if OAUTH_ENABLED and OAUTH_PROVIDER == 'google':
+            if OAUTH_AUDIENCE and OAUTH_AUDIENCE != GOOGLE_CLIENT_ID:
+                print(f"[ERROR] For Google ID tokens, OAUTH_AUDIENCE must equal GOOGLE_CLIENT_ID. Got OAUTH_AUDIENCE={OAUTH_AUDIENCE}, GOOGLE_CLIENT_ID={GOOGLE_CLIENT_ID}")
+                print("[ERROR] Disabling OAuth due to configuration error.")
+                OAUTH_ENABLED = False
+            # Set OAUTH_AUDIENCE from GOOGLE_CLIENT_ID for Google provider
+            OAUTH_AUDIENCE = GOOGLE_CLIENT_ID
+
+        # Configure log level
+        LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+
+        # Only log OAuth config at DEBUG level to avoid exposing partial credentials
+        if LOG_LEVEL == 'DEBUG':
+            print(f"OAuth authentication: {'enabled' if OAUTH_ENABLED else 'disabled'}", flush=True)
+            if GOOGLE_CLIENT_ID:
+                masked_client_id = (GOOGLE_CLIENT_ID[:8] + '...' if len(GOOGLE_CLIENT_ID) > 8 else GOOGLE_CLIENT_ID)
+                print(f"Google Client ID: {masked_client_id}", flush=True)
+        else:
+            print(f"OAuth authentication: {'enabled' if OAUTH_ENABLED else 'disabled'}", flush=True)
+
+        print(f"SSE transport listening on 0.0.0.0:{port}", flush=True)
+
+        # Build the SSE app
+        sse_app = mcp.http_app(transport='sse')
+
+        # Apply OAuth middleware to the SSE app if enabled
+        protected_app = OAuth2BearerMiddleware(sse_app, GOOGLE_CLIENT_ID, enabled=OAUTH_ENABLED) if OAUTH_ENABLED else sse_app
+
+        # Create a Starlette root app that exposes /health publicly and mounts the protected MCP app at /sse
+        app = Starlette(routes=[
+            Route('/health', health_check, methods=['GET']),
+            Mount('/sse', protected_app)
+        ])
+
+        print(f"Health check endpoint available at: http://0.0.0.0:{port}/health")
+
+        # Run with uvicorn
+        uvicorn.run(app, host='0.0.0.0', port=port)
+    else:
+        # For stdio transport, run without host/port
+        print("STDIO transport active. No HTTP server will be started.", flush=True)
+        mcp.run(transport='stdio')

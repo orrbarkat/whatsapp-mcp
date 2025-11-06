@@ -1,0 +1,145 @@
+# Cloud Run Service Configuration for WhatsApp MCP Server
+#
+# DEPLOYMENT INSTRUCTIONS:
+# 1. Replace ALL_CAPS placeholders below with your actual values:
+#    - PROJECT_ID: Your GCP project ID
+#    - REGION: Cloud Run region (e.g., us-central1)
+#    - SERVICE_ACCOUNT_EMAIL: Service account email
+#    - REPO_NAME: Artifact Registry repository name
+#    - TAG: Image tag (e.g., latest)
+#    - GCS_SESSION_BUCKET: GCS bucket name for session data
+#    - GCS_SESSION_OBJECT_NAME: Object name/path for session data
+#
+# 2. Create secrets in Secret Manager before deployment:
+#    gcloud secrets create whatsapp-mcp-google-client-id --data-file=- <<EOF
+#    YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com
+#    EOF
+#
+#    gcloud secrets create whatsapp-mcp-oauth-audience --data-file=- <<EOF
+#    YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com
+#    EOF
+#
+#    # Optional: If using Supabase for database
+#    gcloud secrets create whatsapp-mcp-supabase-url --data-file=- <<EOF
+#    https://xxxxx.supabase.co
+#    EOF
+#
+#    gcloud secrets create whatsapp-mcp-supabase-key --data-file=- <<EOF
+#    your-supabase-key
+#    EOF
+#
+# 3. Grant service account access to secrets:
+#    gcloud secrets add-iam-policy-binding SECRET_NAME \
+#      --member="serviceAccount:SERVICE_ACCOUNT_EMAIL" \
+#      --role="roles/secretmanager.secretAccessor"
+#
+# 4. Deploy:
+#    gcloud run services replace cloudrun.yaml --region=REGION
+#
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: whatsapp-mcp
+  labels:
+    cloud.googleapis.com/location: REGION
+spec:
+  template:
+    metadata:
+      annotations:
+        # Service account with Secret Manager Accessor and Storage Object Admin roles
+        run.googleapis.com/service-account: SERVICE_ACCOUNT_EMAIL
+        # Use second-generation execution environment for better performance
+        run.googleapis.com/execution-environment: gen2
+        # Disable CPU throttling for consistent performance
+        run.googleapis.com/cpu-throttling: "false"
+        # Enable CPU boost during startup for faster container initialization
+        run.googleapis.com/startup-cpu-boost: "true"
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+      - name: whatsapp-mcp
+        image: REGION-docker.pkg.dev/PROJECT_ID/REPO_NAME/whatsapp-mcp:TAG
+        ports:
+        - name: http1
+          containerPort: 3000
+        env:
+        # MCP Transport Configuration
+        - name: MCP_TRANSPORT
+          value: "sse"
+        - name: PORT
+          value: "3000"
+        - name: MCP_PORT
+          value: "3000"
+
+        # WhatsApp Bridge Configuration
+        - name: WHATSAPP_BRIDGE_URL
+          value: "http://localhost:8080"
+
+        # GCS Session Storage Configuration
+        - name: GCS_SESSION_BUCKET
+          value: GCS_SESSION_BUCKET
+        - name: GCS_SESSION_OBJECT_NAME
+          value: GCS_SESSION_OBJECT_NAME
+
+        # OAuth Configuration
+        - name: OAUTH_ENABLED
+          value: "true"
+
+        # Secret Manager References
+        - name: GOOGLE_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: whatsapp-mcp-google-client-id
+              key: latest
+        - name: OAUTH_AUDIENCE
+          valueFrom:
+            secretKeyRef:
+              name: whatsapp-mcp-oauth-audience
+              key: latest
+
+        # Optional: Supabase secrets (uncomment if using Supabase)
+        # - name: SUPABASE_URL
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: whatsapp-mcp-supabase-url
+        #       key: latest
+        # - name: SUPABASE_KEY
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: whatsapp-mcp-supabase-key
+        #       key: latest
+
+        resources:
+          limits:
+            cpu: "2"
+            memory: 2Gi
+          requests:
+            cpu: "1"
+            memory: 512Mi
+
+        # Startup probe - allows up to 40s for initial startup
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          timeoutSeconds: 3
+          periodSeconds: 5
+          failureThreshold: 8
+
+        # Liveness probe - checks health during normal operation
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          timeoutSeconds: 3
+          periodSeconds: 10
+          failureThreshold: 3
+
+      # Scaling configuration
+      minScale: 0
+      maxScale: 10
+
+  traffic:
+  - percent: 100
+    latestRevision: true

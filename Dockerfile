@@ -58,14 +58,26 @@ RUN mkdir -p ../qr-codes
 
 # Create a non-root user for security but ensure proper permissions
 RUN useradd -m -u 1000 mcpuser && \
+    chmod +x /app/whatsapp-bridge/whatsapp-bridge && \
     chown -R mcpuser:mcpuser /app
 USER mcpuser
 
 # Expose both MCP server port and bridge API port
 EXPOSE 3000 8080
 
+# OCI metadata labels for traceability and Cloud Run compatibility
+LABEL org.opencontainers.image.description="WhatsApp MCP Server with integrated Go bridge for Claude Desktop integration"
+LABEL org.opencontainers.image.source="https://github.com/yourusername/whatsapp-mcp"
+LABEL cloud.run.compatible="true"
+
+# Healthcheck for local Docker and testing (Cloud Run ignores Docker HEALTHCHECK)
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-3000}/health || exit 1
+
 # Set environment variables for proper paths
 ENV WHATSAPP_DB_PATH=/app/whatsapp-bridge/store
 
 # Run the MCP server - it will automatically manage the bridge process
+# Use exec form to ensure proper signal handling (SIGTERM from Cloud Run)
+# This allows graceful shutdown of both Python and Go bridge processes
 CMD ["uv", "run", "main.py"]

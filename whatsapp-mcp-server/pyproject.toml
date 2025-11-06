@@ -11,4 +11,9 @@ dependencies = [
     "psutil>=6.1.0",
     "requests>=2.32.3",
     "supabase>=2.0.0",
+    "google-auth>=2.35.0",
+    "google-cloud-storage>=2.18.0",
+    "cachetools>=5.5.0",
+    "starlette>=0.41.0",
+    "uvicorn>=0.30.0",
 ]

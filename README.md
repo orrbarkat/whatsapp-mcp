@@ -16,6 +16,8 @@ Here's an example of what you can do when it's connected to Claude.
 
 ## Installation
 
+> **For production deployments on Google Cloud Platform**, see the [GCP Cloud Run Deployment](#deploying-to-google-cloud-platform-gcp) section below.
+
 ### Prerequisites
 
 - Go
@@ -235,10 +237,46 @@ DATABASE_URL="postgres://user:pass@host:5432/messages"
 
 #### Schema Management
 
-**Automatic Creation:**
-- Database tables are created automatically on first run
-- No manual migration required
-- Schema adapts to the selected database driver (SQLite vs PostgreSQL)
+**Database Schema Setup:**
+
+The database schema must be pre-created before running the bridge. The bridge requires two core tables: `chats` and `messages`.
+
+**Required Tables:**
+
+1. **chats** table:
+   - `jid` (TEXT PRIMARY KEY): Chat identifier
+   - `name` (TEXT): Chat display name
+   - `last_message_time` (TIMESTAMP): Timestamp of most recent message
+
+2. **messages** table:
+   - `id` (TEXT): Message identifier
+   - `chat_jid` (TEXT): Foreign key to chats(jid)
+   - `sender` (TEXT): Message sender identifier
+   - `content` (TEXT): Message content
+   - `timestamp` (TIMESTAMP): Message timestamp
+   - `is_from_me` (BOOLEAN): Whether message is from authenticated user
+   - `media_type` (TEXT NULL): Type of media if applicable
+   - `filename` (TEXT NULL): Media filename if applicable
+   - `url` (TEXT NULL): Media URL if applicable
+   - `media_key` (BLOB/BYTEA NULL): Encryption key for media
+   - `file_sha256` (BLOB/BYTEA NULL): File hash
+   - `file_enc_sha256` (BLOB/BYTEA NULL): Encrypted file hash
+   - `file_length` (INTEGER/BIGINT NULL): File size in bytes
+   - PRIMARY KEY: (id, chat_jid)
+
+**Applying Migrations:**
+
+Run the base schema migration before starting the bridge:
+
+```bash
+# For SQLite
+sqlite3 store/messages.db < whatsapp-mcp-server/migrations/000_create_bridge_tables.sql
+
+# For PostgreSQL
+psql $DATABASE_URL -f whatsapp-mcp-server/migrations/000_create_bridge_tables.sql
+```
+
+For Cloud SQL deployments, see `gcp/DATABASE_SETUP.md` for detailed setup instructions.
 
 **Type Mapping:**
 | SQLite Type | PostgreSQL Type | Usage |
@@ -248,6 +286,49 @@ DATABASE_URL="postgres://user:pass@host:5432/messages"
 | `TEXT` | `TEXT` | Messages, names, JIDs |
 | `TIMESTAMP` | `TIMESTAMP` | Message times |
 | `BOOLEAN` | `BOOLEAN` | Flags (is_from_me) |
+
+**Required Tables:**
+
+The following tables must exist before running the bridge:
+
+1. **chats**
+   - Columns: `jid` (TEXT PRIMARY KEY), `name` (TEXT), `last_message_time` (TIMESTAMP)
+   - Purpose: Stores chat/group metadata
+
+2. **messages**
+   - Columns:
+     - `id` (TEXT, part of primary key)
+     - `chat_jid` (TEXT, part of primary key, foreign key to chats.jid)
+     - `sender` (TEXT)
+     - `content` (TEXT)
+     - `timestamp` (TIMESTAMP)
+     - `is_from_me` (BOOLEAN)
+     - `media_type` (TEXT, nullable)
+     - `filename` (TEXT, nullable)
+     - `url` (TEXT, nullable)
+     - `media_key` (BLOB for SQLite, BYTEA for PostgreSQL, nullable)
+     - `file_sha256` (BLOB for SQLite, BYTEA for PostgreSQL, nullable)
+     - `file_enc_sha256` (BLOB for SQLite, BYTEA for PostgreSQL, nullable)
+     - `file_length` (INTEGER for SQLite, BIGINT for PostgreSQL, nullable)
+   - Primary Key: (id, chat_jid)
+   - Purpose: Stores message history and media metadata
+
+**Quick Migration Commands:**
+
+```bash
+# For SQLite (local development)
+sqlite3 store/messages.db < whatsapp-mcp-server/migrations/000_create_bridge_tables.sql
+
+# For PostgreSQL (production/cloud)
+export DATABASE_URL="postgresql://user:password@host:5432/dbname"
+psql $DATABASE_URL -f whatsapp-mcp-server/migrations/000_create_bridge_tables.sql
+
+# For Cloud SQL (see gcp/DATABASE_SETUP.md for details)
+psql "host=localhost user=whatsapp_user dbname=whatsapp_mcp" \
+  -f whatsapp-mcp-server/migrations/000_create_bridge_tables.sql
+```
+
+See `gcp/DATABASE_SETUP.md` for detailed Cloud SQL setup instructions.
 
 **Migration from SQLite to PostgreSQL:**
 1. Export your SQLite data (if needed)
@@ -561,3 +642,475 @@ uv run main.py
 - **Production Docker**: Use SSE transport with Docker Compose
 - **CI/CD Pipelines**: Use Docker with SSE transport for testing
 - **Development Docker**: Use SSE transport for consistency with production
+
+## Deploying to Google Cloud Platform (GCP)
+
+The WhatsApp MCP server can be deployed to Google Cloud Platform using Cloud Run for serverless, auto-scaling infrastructure with OAuth 2.1 authentication. This deployment includes:
+
+- **Cloud Run**: Containerized MCP server with automatic scaling and OAuth protection
+- **Supabase**: Managed PostgreSQL database via REST API for message storage (optional)
+- **Cloud Storage**: GCS bucket for WhatsApp session persistence and backup
+- **Secret Manager**: Secure storage for OAuth credentials and database configuration
+- **Identity Platform**: OAuth 2.1 authentication for secure remote client access
+
+**Note**: The current implementation uses SQLite by default or Supabase REST API for database access. Direct PostgreSQL/Cloud SQL connectivity is not currently supported.
+
+### Authentication Overview
+
+The WhatsApp MCP server uses OAuth 2.1 for secure client authentication when deployed remotely:
+
+1. **Authentication Flow:**
+   - Client obtains Bearer token from Google Identity Platform
+   - Token included in Authorization header with each request
+   - Server validates JWT token signature and claims
+   - Only authorized clients can access the MCP server
+
+2. **Security Benefits:**
+   - Modern OAuth 2.1 protocol with enhanced security
+   - JWT-based token validation with audience checking
+   - Automatic token expiration and rotation
+   - Secure client credentials storage in Secret Manager
+   - Token-based access control for multi-user deployments
+
+3. **Client Configuration:**
+   - Web-based OAuth consent flow for browser clients
+   - Service account authentication for automated tools
+   - Fine-grained access control with custom claims
+   - Support for organizational and public clients
+
+### Prerequisites
+
+1. **Google Cloud SDK:**
+   ```bash
+   # Install Google Cloud SDK
+   brew install google-cloud-sdk   # macOS
+   
+   # Configure SDK
+   gcloud init
+   gcloud auth login
+   gcloud config set project YOUR_PROJECT_ID
+   ```
+
+2. **Required APIs:**
+   ```bash
+   # Enable necessary APIs
+   gcloud services enable \
+     run.googleapis.com \
+     secretmanager.googleapis.com \
+     storage.googleapis.com \
+     iamcredentials.googleapis.com \
+     identitytoolkit.googleapis.com
+   ```
+
+3. **Development Tools:**
+   - Docker Desktop (for building container images)
+   - Terraform (optional, for infrastructure as code)
+   - Cloud SQL Proxy (for local database access)
+
+### OAuth 2.1 Setup
+
+Before deploying the server, set up OAuth 2.1 authentication:
+
+1. **Configure OAuth Consent Screen:**
+   ```bash
+   # Open OAuth consent screen configuration
+   open "https://console.cloud.google.com/apis/credentials/consent"
+   
+   # Configure settings:
+   # - User Type: Internal (recommended) or External
+   # - App Name: "WhatsApp MCP Server"
+   # - Support Email: Your team's email
+   # - Developer Contact: Your team's email
+   ```
+
+2. **Create OAuth Credentials:**
+   ```bash
+   # Create OAuth 2.0 Client ID
+   open "https://console.cloud.google.com/apis/credentials"
+   
+   # Click "Create Credentials" → "OAuth 2.0 Client ID"
+   # Choose application type based on your client:
+   # - Web Application: For browser-based clients
+   # - Desktop Application: For CLI tools
+   ```
+
+3. **Store Credentials in Secret Manager:**
+   ```bash
+   # Store OAuth Client ID
+   echo -n "YOUR_CLIENT_ID.apps.googleusercontent.com" | \
+     gcloud secrets create whatsapp-mcp-google-client-id \
+     --replication-policy="automatic" \
+     --data-file=-
+
+   # Store OAuth Audience (should match your Google OAuth Client ID)
+   # For Google ID tokens, the audience claim equals the OAuth Client ID
+   echo -n "YOUR_CLIENT_ID.apps.googleusercontent.com" | \
+     gcloud secrets create whatsapp-mcp-oauth-audience \
+     --replication-policy="automatic" \
+     --data-file=-
+   ```
+
+### Quick Start with Automated Setup
+
+Deploy the server with automated infrastructure setup:
+
+```bash
+# Set project ID and OAuth configuration
+export GCP_PROJECT_ID=your-project-id
+export OAUTH_CLIENT_ID=your-client-id.apps.googleusercontent.com
+# OAUTH_AUDIENCE should match the Google OAuth Client ID for Google ID tokens
+export OAUTH_AUDIENCE=your-client-id.apps.googleusercontent.com
+
+# Run automated setup with OAuth configuration
+./gcp/setup.sh
+```
+
+This script will:
+1. Enable required APIs (including Identity Platform)
+2. Create a service account with OAuth and storage permissions
+3. Create a GCS bucket for session storage
+4. Configure OAuth credentials and secrets
+5. Display deployment instructions
+
+**Note**: If you need PostgreSQL, set up a Supabase project and configure `SUPABASE_URL` and `SUPABASE_KEY` secrets.
+
+### Alternative: Terraform Deployment
+
+For infrastructure as code with OAuth configuration:
+
+```bash
+# Navigate to Terraform directory
+cd gcp/terraform
+
+# Configure OAuth and project settings
+cat > terraform.tfvars <<EOF
+project_id = "your-project-id"
+oauth_client_id = "your-client-id.apps.googleusercontent.com"
+# OAuth audience should match the Client ID for Google ID tokens
+oauth_audience = "your-client-id.apps.googleusercontent.com"
+EOF
+
+# Deploy infrastructure
+terraform init
+terraform plan
+terraform apply
+```
+
+### Build and Deploy to Cloud Run
+
+Deploy the server with OAuth authentication enabled:
+
+```bash
+# Build and push container image using Artifact Registry
+gcloud builds submit --tag us-central1-docker.pkg.dev/${GCP_PROJECT_ID}/whatsapp-mcp/whatsapp-mcp:latest
+
+# Deploy to Cloud Run with OAuth configuration
+gcloud run deploy whatsapp-mcp \
+  --image=us-central1-docker.pkg.dev/${GCP_PROJECT_ID}/whatsapp-mcp/whatsapp-mcp:latest \
+  --region=us-central1 \
+  --platform=managed \
+  --service-account=whatsapp-mcp-sa@${GCP_PROJECT_ID}.iam.gserviceaccount.com \
+  --update-secrets=\
+GOOGLE_CLIENT_ID=whatsapp-mcp-google-client-id:latest,\
+OAUTH_AUDIENCE=whatsapp-mcp-oauth-audience:latest \
+  --set-env-vars=\
+MCP_TRANSPORT=sse,\
+MCP_PORT=8000,\
+WHATSAPP_BRIDGE_URL=http://localhost:8080,\
+GCS_SESSION_BUCKET=${GCP_PROJECT_ID}-whatsapp-sessions,\
+GCS_SESSION_OBJECT_NAME=whatsapp.db,\
+OAUTH_ENABLED=true
+
+# Optional: Add Supabase secrets if using Supabase for database
+# --update-secrets=SUPABASE_URL=whatsapp-mcp-supabase-url:latest,SUPABASE_KEY=whatsapp-mcp-supabase-key:latest
+
+### Database and OAuth Setup
+
+1. **Database Configuration:**
+
+   The server uses SQLite by default (no configuration needed). For Supabase PostgreSQL:
+
+   ```bash
+   # Create Supabase project at https://supabase.com
+   # Get your project URL and keys from Settings → API
+
+   # Store Supabase credentials in Secret Manager
+   echo -n "https://xxxxx.supabase.co" | \
+     gcloud secrets create whatsapp-mcp-supabase-url \
+     --replication-policy="automatic" \
+     --data-file=-
+
+   echo -n "your-supabase-anon-or-service-role-key" | \
+     gcloud secrets create whatsapp-mcp-supabase-key \
+     --replication-policy="automatic" \
+     --data-file=-
+   ```
+
+2. **OAuth Client Configuration:**
+   ```bash
+   # Obtain a Google ID token for your OAuth Client ID
+   # The token's audience claim must match your GOOGLE_CLIENT_ID
+   # For testing, you can use gcloud to generate a token:
+   gcloud auth print-identity-token --audiences=YOUR_CLIENT_ID.apps.googleusercontent.com
+
+   # Test OAuth configuration with /health endpoint (no auth required)
+   curl "https://YOUR-SERVICE-URL/health"
+
+   # Should return HTTP 200 OK
+   ```
+
+3. **Validate Deployment:**
+   ```bash
+   # Check service and OAuth status
+   gcloud run services describe whatsapp-mcp-server \
+     --region=us-central1 \
+     --format="yaml(status,metadata.annotations)"
+   ```
+
+### Security Configuration
+
+#### IAM Roles and Permissions
+
+Configure minimal required IAM roles for the Cloud Run service account:
+
+```bash
+# Required: Secret Manager access
+gcloud projects add-iam-policy-binding PROJECT_ID \
+  --member="serviceAccount:whatsapp-mcp-sa@PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+
+# Required: Storage access (grant at bucket level, not project)
+gcloud storage buckets add-iam-policy-binding \
+  gs://PROJECT_ID-whatsapp-sessions \
+  --member="serviceAccount:whatsapp-mcp-sa@PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+```
+
+**Important**: Avoid granting project-level Editor or Owner roles.
+
+#### OAuth 2.1 Settings
+
+1. **Token Management:**
+   - Use short-lived tokens (1 hour expiry)
+   - Implement automatic token refresh
+   - Never commit tokens to version control
+   - Monitor OAuth usage in audit logs
+
+2. **Client Security:**
+   - Use separate client IDs for dev/staging/prod
+   - Configure appropriate scopes and permissions
+   - Implement token validation on client side
+   - Store credentials in Secret Manager only
+
+3. **Server Security:**
+   - Enable OAuth for all endpoints except /health
+   - Configure audience validation (Client ID)
+   - Set up CORS for allowed origins if needed
+
+#### Secrets Management
+
+1. **Rotation cadence:**
+   - OAuth credentials: Every 90 days
+   - Supabase keys: Every 180 days
+   - Immediate rotation on security incidents
+
+2. **Audit logging:**
+   ```bash
+   # Enable Data Access logs for Secret Manager
+   # Console: IAM & Admin → Audit Logs → Secret Manager
+   # Enable: Admin Read, Data Read, Data Write
+
+   # Monitor secret access
+   gcloud logging read \
+     "resource.type=secretmanager.googleapis.com/Secret" \
+     --limit=50
+   ```
+
+3. **Access control:**
+   - Grant secretAccessor role only to required service accounts
+   - Use separate secrets per environment
+   - Enable automatic secret versioning
+
+#### Network Security
+
+1. **Ingress controls:**
+   ```bash
+   # Restrict Cloud Run ingress
+   gcloud run services update whatsapp-mcp \
+     --ingress=internal-and-cloud-load-balancing
+   ```
+
+2. **VPC Service Controls** (optional):
+   - Create service perimeter for Secret Manager
+   - Restrict data exfiltration
+   - Requires organization-level VPC-SC setup
+
+3. **Cloud Armor** (optional):
+   - Deploy Cloud Load Balancer
+   - Configure rate limiting and DDoS protection
+   - Implement geo-blocking if needed
+
+### GCP Documentation
+
+Complete documentation is available in the `gcp/` directory:
+
+- **[gcp/API_REQUIREMENTS.md](gcp/API_REQUIREMENTS.md)**: Required GCP APIs including Identity Platform
+- **[gcp/OAUTH_SETUP.md](gcp/OAUTH_SETUP.md)**: Detailed OAuth 2.1 configuration guide
+- **[gcp/README.md](gcp/README.md)**: Cloud Run deployment guide
+- **[gcp/env-template.yaml](gcp/env-template.yaml)**: Environment variables reference
+- **[gcp/setup.sh](gcp/setup.sh)**: Automated provisioning script
+- **[gcp/terraform/](gcp/terraform/)**: Infrastructure as code
+
+### Monitoring and Management
+
+1. **Service Monitoring:**
+   ```bash
+   # View service logs with OAuth events
+   gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=whatsapp-mcp AND jsonPayload.oauth=*" --limit=50
+
+   # Monitor OAuth token usage
+   gcloud run services describe whatsapp-mcp \
+     --region=us-central1 \
+     --format="yaml(status.traffic,status.conditions)"
+   ```
+
+2. **Management Consoles:**
+   - **Cloud Run**: [Service Dashboard](https://console.cloud.google.com/run)
+   - **OAuth**: [Credentials](https://console.cloud.google.com/apis/credentials)
+   - **Cloud SQL**: [Database](https://console.cloud.google.com/sql)
+   - **Secret Manager**: [Secrets](https://console.cloud.google.com/security/secret-manager)
+   - **Storage**: [GCS Buckets](https://console.cloud.google.com/storage)
+
+3. **OAuth Usage Stats:**
+   - Token issuance metrics
+   - Active client tracking
+   - Authentication failures
+   - Token revocations
+
+### Cost Considerations
+
+Monthly cost estimates for running WhatsApp MCP on GCP:
+
+#### Development Environment
+- **Cloud Run**: Free tier (2M requests/month) - ~$0
+- **Cloud Storage**: 5GB free tier - ~$0
+- **Secret Manager**: 6 secrets, free tier - ~$0
+- **Total**: ~$0-5/month (if within free tiers)
+
+#### Production Environment (Low Traffic)
+- **Cloud Run**: Min instances=0, ~100K requests/month - ~$0-10
+- **Cloud Storage**: 10GB session data - ~$0.20
+- **Secret Manager**: 6 secrets - ~$0.06
+- **Supabase** (optional): Free tier or ~$25/month for Pro
+- **Total**: ~$0-35/month
+
+#### Production Environment (High Availability)
+- **Cloud Run**: Min instances=1, ~1M requests/month - ~$50-100
+- **Cloud Storage**: 50GB session data + backups - ~$1
+- **Secret Manager**: 10 secrets with rotation - ~$0.10
+- **Supabase Pro**: ~$25/month
+- **Total**: ~$75-125/month
+
+#### Cost Optimization Tips:
+- Use min-instances=0 for development
+- Implement request caching to reduce Cloud Run costs
+- Use GCS lifecycle policies to archive old session data
+- Monitor usage with Cost Alerts and Budgets
+- Leverage free tiers for small deployments
+
+### Troubleshooting
+
+1. **OAuth Issues:**
+   - **Invalid Token**: Check audience and issuer claims
+   - **Token Expired**: Verify token lifetime settings
+   - **Missing Claims**: Review OAuth consent screen
+   - **CORS Errors**: Check allowed origins
+
+2. **Infrastructure:**
+   - **API Not Enabled**: Run setup script or enable manually
+   - **Storage Access**: Check GCS bucket permissions
+   - **Secrets**: Verify Secret Manager access
+   - **Container**: Validate build and dependencies
+   - **Supabase Connection**: Verify URL and key if using Supabase
+
+3. **Common Fixes:**
+   ```bash
+   # Test health endpoint (should bypass OAuth)
+   curl -v "https://YOUR-SERVICE-URL/health"  # Should return 200 OK
+
+   # Obtain a Google ID token with correct audience for testing
+   TOKEN=$(gcloud auth print-identity-token --audiences=YOUR_CLIENT_ID.apps.googleusercontent.com)
+
+   # Check service account permissions
+   gcloud projects get-iam-policy ${GCP_PROJECT_ID} \
+     --flatten="bindings[].members" \
+     --filter="bindings.members:whatsapp-mcp-sa"
+
+   # View service logs for OAuth errors
+   gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=whatsapp-mcp" --limit=50
+   ```
+
+### Remote MCP Client Configuration
+
+Once deployed to Cloud Run, configure your MCP clients (Claude Desktop or Cursor) to connect to the remote server:
+
+#### Claude Desktop Configuration
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "whatsapp-remote": {
+      "transport": "sse",
+      "url": "https://whatsapp-mcp-xxxxx-uc.a.run.app/sse",
+      "headers": {
+        "Authorization": "Bearer YOUR_GOOGLE_ID_TOKEN"
+      }
+    }
+  }
+}
+```
+
+#### Cursor Configuration
+
+Edit `~/.cursor/mcp.json` (macOS/Linux) or `%USERPROFILE%\.cursor\mcp.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "whatsapp-remote": {
+      "transport": "sse",
+      "url": "https://whatsapp-mcp-xxxxx-uc.a.run.app/sse",
+      "headers": {
+        "Authorization": "Bearer YOUR_GOOGLE_ID_TOKEN"
+      }
+    }
+  }
+}
+```
+
+#### Obtaining Google ID Tokens
+
+To get a valid token for authentication:
+
+```bash
+# Generate a Google ID token with your OAuth Client ID as the audience
+gcloud auth print-identity-token --audiences=YOUR_CLIENT_ID.apps.googleusercontent.com
+```
+
+**Token Refresh**: Google ID tokens expire after 1 hour. You'll need to refresh the token periodically:
+- Manually update the config file with a new token
+- Or use a token refresh script/tool to automate token updates
+
+#### Security Notes for Remote Access
+
+- **Never commit tokens** to version control
+- **Use environment variables** or secure credential storage for tokens
+- **Rotate tokens** regularly and monitor access logs
+- **Enable audit logging** in Secret Manager and Cloud Run
+- **Consider VPC-SC** for additional network isolation
+
+For detailed guides, see:
+- [gcp/OAUTH_SETUP.md](gcp/OAUTH_SETUP.md) for OAuth troubleshooting
+- [gcp/README.md](gcp/README.md) for Cloud Run deployment details

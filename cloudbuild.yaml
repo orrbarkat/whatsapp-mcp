@@ -1,0 +1,86 @@
+# Cloud Build configuration for WhatsApp MCP Server
+# This pipeline builds and deploys the application to Cloud Run
+
+substitutions:
+  _REGION: us-central1
+  _REPOSITORY: whatsapp-mcp
+  _SERVICE_NAME: whatsapp-mcp
+  _IMAGE_TAG: ${SHORT_SHA}
+  _SERVICE_ACCOUNT: whatsapp-mcp-sa@${PROJECT_ID}.iam.gserviceaccount.com
+  _GCS_SESSION_BUCKET: ${PROJECT_ID}-whatsapp-sessions
+
+steps:
+  # Step 1: Build the Docker image with two tags (commit SHA and latest)
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-image'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${_IMAGE_TAG}'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:latest'
+      - '-f'
+      - 'Dockerfile'
+      - '.'
+
+  # Step 2: Push all tags to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-image-sha'
+    args:
+      - 'push'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${_IMAGE_TAG}'
+    waitFor: ['build-image']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-image-latest'
+    args:
+      - 'push'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:latest'
+    waitFor: ['build-image']
+
+  # Step 3: Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-cloud-run'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${_IMAGE_TAG}'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+      - '--service-account=${_SERVICE_ACCOUNT}'
+      - '--update-secrets=GOOGLE_CLIENT_ID=whatsapp-mcp-google-client-id:latest,OAUTH_AUDIENCE=whatsapp-mcp-oauth-audience:latest'
+      - '--set-env-vars=MCP_TRANSPORT=sse,PORT=3000,MCP_PORT=3000,WHATSAPP_BRIDGE_URL=http://localhost:8080,GCS_SESSION_BUCKET=${_GCS_SESSION_BUCKET},GCS_SESSION_OBJECT_NAME=whatsapp.db,OAUTH_ENABLED=true'
+      - '--allow-unauthenticated'
+      - '--min-instances=0'
+      - '--max-instances=10'
+      - '--cpu=2'
+      - '--memory=2Gi'
+      - '--timeout=300'
+      - '--concurrency=80'
+      - '--port=3000'
+      - '--execution-environment=gen2'
+      - '--no-cpu-throttling'
+    waitFor: ['push-image-sha', 'push-image-latest']
+
+# Build timeout (30 minutes)
+timeout: 1800s
+
+# Build options
+options:
+  machineType: 'N1_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+  substitutionOption: 'ALLOW_LOOSE'
+
+# Images to be pushed to Artifact Registry
+images:
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:${_IMAGE_TAG}'
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}:latest'
+
+# Build tags for organization
+tags:
+  - 'whatsapp-mcp'
+  - 'cloud-run'
+  - '${_SERVICE_NAME}'
+  - 'commit-${SHORT_SHA}'
