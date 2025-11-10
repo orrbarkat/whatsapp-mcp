@@ -5,7 +5,7 @@ claude_desktop_config.json
 .env
 *.log
 *.pid
-qr_codes
+qr-codes
 
 # Terraform
 .terraform/

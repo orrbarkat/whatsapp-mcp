@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -74,9 +75,24 @@ func getDatabaseConfig(envVar string, defaultDriver string, defaultDSN string) D
 
 	// Parse DATABASE_URL
 	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {
-		// PostgreSQL connection string - use original URL directly
-		// lib/pq handles postgres:// and postgresql:// URLs natively
-		// This preserves all query parameters including sslmode, timeouts, etc.
+		// PostgreSQL connection string
+		// Only default to sslmode=disable for localhost connections
+		if !strings.Contains(databaseURL, "sslmode=") {
+			// Check if this is a local connection
+			isLocal := strings.Contains(databaseURL, "@localhost") ||
+				strings.Contains(databaseURL, "@127.0.0.1") ||
+				strings.Contains(databaseURL, "@::1")
+
+			if isLocal {
+				// Local database - disable SSL
+				if strings.Contains(databaseURL, "?") {
+					databaseURL += "&sslmode=disable"
+				} else {
+					databaseURL += "?sslmode=disable"
+				}
+			}
+			// For remote databases (Supabase, etc.), leave sslmode unset unless explicitly provided
+		}
 		return DatabaseConfig{
 			DriverName:     "postgres",
 			DataSourceName: databaseURL,
@@ -199,24 +215,8 @@ type MessageStore struct {
 }
 
 // Initialize message store
-func NewMessageStore() (*MessageStore, error) {
-	// Get database configuration
-	config := getDatabaseConfig("DATABASE_URL", "sqlite3", "file:store/messages.db?_foreign_keys=on")
-
-	// Create directory for database if it doesn't exist (only for SQLite)
-	if config.DriverName == "sqlite3" {
-		if err := os.MkdirAll("store", 0755); err != nil {
-			return nil, fmt.Errorf("failed to create store directory: %v", err)
-		}
-	}
-
-	// Open database with selected driver
-	db, err := sql.Open(config.DriverName, config.DataSourceName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open message database: %v", err)
-	}
-
-	fmt.Printf("Message store using driver: %s\n", config.DriverName)
+func NewMessageStore(db *sql.DB, driverName string) (*MessageStore, error) {
+	fmt.Printf("Message store using driver: %s\n", driverName)
 
 	// Verify database connection
 	if err := db.Ping(); err != nil {
@@ -227,7 +227,7 @@ func NewMessageStore() (*MessageStore, error) {
 	// Validate that required tables exist
 	var missingTables []string
 
-	if config.DriverName == "postgres" {
+	if driverName == "postgres" {
 		// For PostgreSQL, use to_regclass with explicit schema to check table existence
 		// This ensures we check the public schema regardless of search_path settings
 		var chatsExists, messagesExists bool
@@ -279,7 +279,7 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("required tables missing: %v. The schema must be created externally", missingTables)
 	}
 
-	return &MessageStore{db: db, driverName: config.DriverName}, nil
+	return &MessageStore{db: db, driverName: driverName}, nil
 }
 
 // Close the database connection
@@ -1657,16 +1657,7 @@ func main() {
 		}
 		logger.Infof("Postgres session DSN host: %s", dsnHost)
 
-		// Check if sslmode is set
-		if !strings.Contains(sessionConfig.DataSourceName, "sslmode=") {
-			logger.Warnf("No sslmode specified in session DSN, appending sslmode=require")
-			// Append sslmode=require
-			if strings.Contains(sessionConfig.DataSourceName, "?") {
-				sessionConfig.DataSourceName += "&sslmode=require"
-			} else {
-				sessionConfig.DataSourceName += "?sslmode=require"
-			}
-		}
+
 
 		// Open temporary connection to validate session tables exist
 		logger.Infof("Validating Postgres session tables...")
@@ -1739,11 +1730,17 @@ func main() {
 
 	fmt.Printf("Session store using driver: %s\n", sessionConfig.DriverName)
 
-	container, err := sqlstore.New(context.Background(), sessionConfig.DriverName, sessionConfig.DataSourceName, dbLog)
+	sessionDB, err := openDatabaseWithIPv4(sessionConfig)
+	if err != nil {
+		logger.Errorf("Failed to open session database: %v", err)
+		return
+	}
+	container, err := sqlstore.New(sessionConfig.DriverName, sessionConfig.DataSourceName, dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
+	container.DB = sessionDB
 
 	// Get device store - This contains session information
 	deviceStore, err := container.GetFirstDevice(context.Background())
@@ -1766,7 +1763,13 @@ func main() {
 	}
 
 	// Initialize message store
-	messageStore, err := NewMessageStore()
+	messageConfig := getDatabaseConfig("DATABASE_URL", "sqlite3", "file:store/messages.db?_foreign_keys=on")
+	messageDB, err := openDatabaseWithIPv4(messageConfig)
+	if err != nil {
+		logger.Errorf("Failed to open message database: %v", err)
+		return
+	}
+	messageStore, err := NewMessageStore(messageDB, messageConfig.DriverName)
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
 		return
@@ -1937,6 +1940,35 @@ func main() {
 	fmt.Println("Disconnecting...")
 	// Disconnect client
 	client.Disconnect()
+}
+
+func openDatabaseWithIPv4(config DatabaseConfig) (*sql.DB, error) {
+	if config.DriverName != "postgres" {
+		return sql.Open(config.DriverName, config.DataSourceName)
+	}
+
+	// Create a custom dialer that forces IPv4
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		DualStack: false, // Explicitly disable dual-stack to prevent IPv6 attempts
+	}
+
+	// Wrap the dialer to ensure "tcp4" is used
+	connector, err := pq.NewConnector(config.DataSourceName)
+	if err != nil {
+		return nil, fmt.Errorf("error creating pq connector: %v", err)
+	}
+
+	type dialerFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+	connector.Dialer(dialerFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Force the network to "tcp4"
+		return dialer.DialContext(ctx, "tcp4", addr)
+	}))
+
+	// Open the database connection using the custom connector
+	db := sql.OpenDB(connector)
+	return db, nil
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info

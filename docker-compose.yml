@@ -1,78 +1,60 @@
 services:
-  # PostgreSQL service (optional - uncomment to use PostgreSQL instead of SQLite)
-  # postgres:
-  #   image: postgres:15-alpine
-  #   container_name: whatsapp-postgres
-  #   environment:
-  #     POSTGRES_DB: whatsapp
-  #     POSTGRES_USER: whatsapp
-  #     POSTGRES_PASSWORD: whatsapp_password
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-  #   ports:
-  #     - "5432:5432"
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U whatsapp"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
-  #   restart: unless-stopped
+  postgres:
+    profiles: [db]
+    image: postgres:15-alpine
+    container_name: whatsapp-postgres
+    environment:
+      POSTGRES_DB: whatsapp
+      POSTGRES_USER: whatsapp
+      POSTGRES_PASSWORD: whatsapp_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U whatsapp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
   whatsapp-mcp:
+    profiles: [app]
     build:
       context: .
       dockerfile: Dockerfile
     container_name: whatsapp-mcp
+    user: "1000:1000"
     volumes:
       # Mount SQLite database directory to persist data (used when DATABASE_URL is not set)
-      - whatsapp_data:/app/whatsapp-bridge/store
+      - whatsapp_data:/app/whatsapp-bridge/store:rw
       # Mount a directory for QR code display
-      - ./qr-codes:/app/qr-codes
+      - ./qr-codes:/app/qr-codes:rw
+      # Temporary directories required for read-only filesystem
+      - /tmp
+      - whatsapp_cache:/home/mcpuser/.cache
     ports:
       # MCP server port
       - "3000:3000"
       # Bridge API port
       - "8080:8080"
+    env_file:
+      - .env
     environment:
-      # Database and storage paths
-      # - WHATSAPP_DB_PATH=/app/whatsapp-bridge/store
-      # - DATABASE_PATH=/app/whatsapp-bridge/store/messages.db
-      # Database configuration (uncomment to use PostgreSQL or Supabase)
-      - DATABASE_URL=${DATABASE_URL}
-      # For PostgreSQL (using local postgres service):
-      # - DATABASE_URL=postgres://whatsapp:whatsapp_password@postgres:5432/whatsapp?sslmode=disable
-      # For Supabase (messages database):
-      # - DATABASE_URL=postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supabase.co:5432/postgres?sslmode=require
-      # - SUPABASE_URL=https://[YOUR-PROJECT-REF].supabase.co
-      # - SUPABASE_KEY=[YOUR-SERVICE-KEY]
-      #
-      # Session database configuration (optional - defaults to DATABASE_URL if not set):
-      # For separate Supabase session storage (recommended for production):
-      # - WHATSAPP_SESSION_DATABASE_URL=postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supabase.co:5432/postgres?sslmode=require
-      # For local PostgreSQL session storage:
-      # - WHATSAPP_SESSION_DATABASE_URL=postgres://whatsapp:whatsapp_password@postgres:5432/whatsapp?sslmode=disable
-      # For SQLite session storage (default):
-      # - WHATSAPP_SESSION_DATABASE_URL=sqlite:///app/whatsapp-bridge/store/whatsapp.db
       # MCP transport mode: 'stdio' (default for local) or 'sse' (recommended for Docker)
       - MCP_TRANSPORT=${MCP_TRANSPORT:-sse}
       # MCP server port for SSE transport
       - MCP_PORT=3000
-      # Cloud Run compatibility: PORT env var
-      - PORT=3000
-      # OAuth configuration (optional for local testing)
-      - OAUTH_ENABLED=${OAUTH_ENABLED:-false}
-      # - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
-      # - OAUTH_AUDIENCE=${OAUTH_AUDIENCE}
       # Bridge API URL (localhost since both services are in same container)
       - WHATSAPP_BRIDGE_URL=http://localhost:8080
-    # Uncomment to wait for PostgreSQL to be ready before starting
     # depends_on:
     #   postgres:
     #     condition: service_healthy
     restart: unless-stopped
     # Health check using the /health endpoint (same as Cloud Run)
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -f http://localhost:$$PORT/health || exit 1"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
       interval: 30s
       timeout: 3s
       retries: 3
@@ -81,6 +63,7 @@ services:
 volumes:
   whatsapp_data:
     driver: local
-  # Uncomment to use PostgreSQL
-  # postgres_data:
-  #   driver: local
+  postgres_data:
+    driver: local
+  whatsapp_cache:
+    driver: local

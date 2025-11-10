@@ -216,8 +216,27 @@ def start_bridge_process() -> Tuple[bool, str]:
         output_thread.daemon = True
         output_thread.start()
         
-        # Wait a moment for the process to start
-        time.sleep(2)
+        # Wait a moment for the process to start and check for immediate errors
+        start_wait_time = time.time()
+        error_message = None
+        while time.time() - start_wait_time < 5: # Increased wait time to capture more output
+            try:
+                line = BRIDGE_OUTPUT_QUEUE.get_nowait()
+                print(f"Bridge startup output: {line}") # Debug output
+                if "Required session table 'devices' does not exist" in line or "Bridge initialization failed" in line:
+                    error_message = line
+                    break
+            except queue.Empty:
+                pass
+            
+            if BRIDGE_PROCESS.poll() is not None:
+                # Process exited, capture its return code
+                return False, f"Bridge process failed to start. Exit code: {BRIDGE_PROCESS.returncode}. Output: {error_message or 'No specific error message captured.'}"
+            
+            time.sleep(0.1) # Check more frequently
+        
+        if error_message:
+            return False, f"Bridge initialization failed: {error_message}"
         
         if BRIDGE_PROCESS.poll() is not None:
             return False, f"Bridge process failed to start. Exit code: {BRIDGE_PROCESS.returncode}"

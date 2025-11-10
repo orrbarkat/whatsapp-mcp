@@ -1,0 +1,5 @@
+FROM golang:1.24-bookworm
+WORKDIR /app
+COPY whatsapp-bridge .
+RUN go build -o whatsapp-bridge main.go
+CMD ["/app/whatsapp-bridge"]

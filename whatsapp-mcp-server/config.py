@@ -13,6 +13,7 @@ import yaml
 from database import DatabaseAdapter
 from database_sqlite import SQLiteDatabaseAdapter
 from database_supabase import SupabaseDatabaseAdapter
+from database_postgres import PostgresDatabaseAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,8 @@ class DatabaseConfig:
         messages_db_path: Optional[str] = None,
         auth_db_path: Optional[str] = None,
         supabase_url: Optional[str] = None,
-        supabase_key: Optional[str] = None
+        supabase_key: Optional[str] = None,
+        db_url: Optional[str] = None
     ):
         """Initialize database configuration.
 
@@ -42,6 +44,7 @@ class DatabaseConfig:
         self.auth_db_path = auth_db_path
         self.supabase_url = supabase_url
         self.supabase_key = supabase_key
+        self.db_url = db_url
 
     @classmethod
     def from_environment(cls) -> "DatabaseConfig":
@@ -123,21 +126,9 @@ class DatabaseConfig:
                 )
 
             elif scheme in ('postgresql', 'postgres'):
-                # postgresql://user:pass@host:port/db
-                # Convert to Supabase format (requires SUPABASE_URL and SUPABASE_KEY)
-                supabase_url = os.getenv("SUPABASE_URL")
-                supabase_key = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
-
-                if not supabase_url or not supabase_key:
-                    raise ValueError(
-                        "PostgreSQL connection requires SUPABASE_URL and SUPABASE_KEY "
-                        "(or SUPABASE_ANON_KEY) environment variables"
-                    )
-
                 return cls(
                     database_type='postgres',
-                    supabase_url=supabase_url,
-                    supabase_key=supabase_key
+                    db_url=database_url
                 )
 
             else:
@@ -191,7 +182,13 @@ def create_database_adapter(config: DatabaseConfig) -> DatabaseAdapter:
                 auth_db_path=config.auth_db_path
             )
 
-        elif config.database_type in ('postgres', 'supabase'):
+        elif config.database_type == 'postgres':
+            logger.info(f"Creating PostgreSQL database adapter (url: {config.db_url})")
+            return PostgresDatabaseAdapter(
+                db_url=config.db_url
+            )
+
+        elif config.database_type == 'supabase':
             logger.info(f"Creating Supabase database adapter (url: {config.supabase_url})")
             return SupabaseDatabaseAdapter(
                 supabase_url=config.supabase_url,

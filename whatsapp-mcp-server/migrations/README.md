@@ -6,6 +6,18 @@ This directory contains SQL migration scripts for the WhatsApp MCP database sche
 
 **IMPORTANT**: Migrations must be applied in numerical order. The base schema migration `000_create_bridge_tables.sql` must be applied first before any other migrations.
 
+## ⚠️ Critical: Migrations Are NOT Automatic
+
+**Migrations must be run manually BEFORE starting the application.** The WhatsApp bridge does NOT automatically apply migrations. If you attempt to start the bridge without first applying the required migrations, it will fail with an error about missing tables.
+
+**For Supabase users:**
+1. Apply migrations to your Supabase database BEFORE starting the container
+2. Use `psql $DATABASE_URL -f migrations/000_create_bridge_tables.sql`
+3. Apply subsequent migration files in numerical order
+4. Verify tables exist before starting the application
+
+See the "How to Apply Migrations" section below for detailed instructions.
+
 ## Migration Files
 
 ### 000_create_bridge_tables.sql
@@ -83,23 +95,32 @@ psql $DATABASE_URL -f whatsapp-mcp-server/migrations/001_create_chat_list_view.s
 
 ### For Supabase
 
-#### Option 1: Supabase Dashboard (Recommended)
+**CRITICAL**: Run these migrations BEFORE starting your Docker container or application. The application will fail to start if tables are missing.
+
+#### Option 1: Using psql (Recommended for automation)
+```bash
+# Set your DATABASE_URL (include ?sslmode=require for Supabase)
+export DATABASE_URL="postgresql://postgres:YOUR_PASSWORD@db.YOUR_PROJECT_REF.supabase.co:5432/postgres?sslmode=require"
+
+# Run migrations in order
+psql $DATABASE_URL -f whatsapp-mcp-server/migrations/000_create_bridge_tables.sql
+psql $DATABASE_URL -f whatsapp-mcp-server/migrations/001_create_chat_list_view.sql
+
+# If using Supabase for session storage (requires migration 010):
+psql $DATABASE_URL -f whatsapp-mcp-server/migrations/010_create_whatsmeow_session_tables.sql
+```
+
+#### Option 2: Supabase Dashboard (Recommended for manual setup)
 1. Go to your Supabase project dashboard
 2. Navigate to **SQL Editor**
 3. Copy the contents of `000_create_bridge_tables.sql`
 4. Paste and execute the SQL
 5. Repeat for `001_create_chat_list_view.sql` and other migrations in order
 
-#### Option 2: Supabase CLI
-```bash
-# If you have the Supabase CLI installed
-supabase db push
-```
-
 #### Option 3: Direct PostgreSQL Connection
 ```bash
 # Connect to your Supabase database
-psql "postgresql://postgres:[YOUR-PASSWORD]@[YOUR-PROJECT-REF].supabase.co:5432/postgres"
+psql "postgresql://postgres:[YOUR-PASSWORD]@[YOUR-PROJECT-REF].supabase.co:5432/postgres?sslmode=require"
 
 # Run migrations in order
 \i whatsapp-mcp-server/migrations/000_create_bridge_tables.sql
@@ -108,6 +129,8 @@ psql "postgresql://postgres:[YOUR-PASSWORD]@[YOUR-PROJECT-REF].supabase.co:5432/
 # If using Supabase for session storage (recommended):
 \i whatsapp-mcp-server/migrations/010_create_whatsmeow_session_tables.sql
 ```
+
+**Note**: Always include `?sslmode=require` in your Supabase connection string for security.
 
 ## Verification
 
