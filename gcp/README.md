@@ -1,549 +1,624 @@
-# Google Cloud Run Deployment Guide
+# Google Cloud Run Deployment
 
-This guide provides comprehensive instructions for deploying the WhatsApp MCP Server to Google Cloud Run. It covers OAuth 2.1 authentication setup, environment configuration, and security best practices.
+This guide has been consolidated and enhanced. Please see:
 
-## Prerequisites
+## [Complete Cloud Run Deployment Guide](../docs/deployment/cloud-run.md)
 
-1. Google Cloud Project setup:
-   ```bash
-   # Install Google Cloud SDK
-   brew install google-cloud-sdk   # macOS
-   
-   # Initialize and set project
-   gcloud init
-   gcloud config set project YOUR_PROJECT_ID
-   
-   # Enable required APIs
-   gcloud services enable \
-     run.googleapis.com \
-     secretmanager.googleapis.com \
-     storage.googleapis.com \
-     iamcredentials.googleapis.com
-   ```
+The comprehensive Cloud Run deployment guide includes:
 
-2. OAuth 2.1 credentials setup:
-   - Go to [Google Cloud Console](https://console.cloud.google.com)
-   - Navigate to "APIs & Services" → "OAuth consent screen"
-   - Configure consent screen (Internal or External)
-   - Create OAuth 2.0 Client ID (see details below)
+- **Prerequisites and API Setup** - Required GCP APIs and tools
+- **OAuth 2.1 Authentication** - Complete OAuth setup with Google Identity Platform
+- **Database Configuration** - Cloud SQL, Supabase, and session storage options
+- **Service Account and IAM** - Minimal required permissions
+- **Deployment Steps** - Build, push, and deploy to Cloud Run
+- **Monitoring and Alerts** - Logging, uptime checks, and error reporting
+- **Cost Optimization** - Pricing estimates and optimization tips
+- **Security Hardening** - IAM roles, network security, and secrets management
+- **Troubleshooting** - Common issues and solutions
 
-## OAuth 2.1 Setup
+---
 
-1. Configure OAuth consent screen:
-   - User Type: Internal (recommended) or External
-   - App name: "WhatsApp MCP Server"
-   - User support email: Your team's email
-   - Application homepage: Your Cloud Run service URL
-   - Authorized domains: Your Cloud Run domain
-   - Developer contact: Your team's email
+## Cloud Build Setup
 
-2. Create OAuth 2.0 Client ID:
-   ```bash
-   # Navigate to Credentials
-   open https://console.cloud.google.com/apis/credentials
-   
-   # Click "Create Credentials" → "OAuth 2.0 Client ID"
-   # Choose application type based on your client:
-   #   - Web application: For browser-based clients
-   #   - Desktop application: For CLI tools
-   ```
+This section covers automating your deployment to Cloud Run using Google Cloud Build. Cloud Build provides continuous integration and deployment from your code repository (GitHub or Cloud Source Repositories) to Cloud Run.
 
-3. Store credentials in Secret Manager:
-   ```bash
-   # Create secrets
-   echo -n "YOUR_CLIENT_ID.apps.googleusercontent.com" | \
-     gcloud secrets create whatsapp-mcp-google-client-id \
-     --replication-policy="automatic" \
-     --data-file=-
+### Prerequisites
 
-   # OAuth audience should match the Google OAuth Client ID for Google ID tokens
-   echo -n "YOUR_CLIENT_ID.apps.googleusercontent.com" | \
-     gcloud secrets create whatsapp-mcp-oauth-audience \
-     --replication-policy="automatic" \
-     --data-file=-
-   ```
+#### Required APIs
 
-## Storage Configuration
-
-### Option A: GCS Session Storage (SQLite-based)
-
-**Note:** GCS session backup only works with SQLite session storage. For production, consider Supabase Postgres sessions (Option B) instead.
-
-1. Create GCS bucket for session storage:
-   ```bash
-   # Create bucket (replace with your desired name)
-   gcloud storage buckets create gs://YOUR_PROJECT-whatsapp-sessions \
-     --location=us-central1 \
-     --uniform-bucket-level-access
-   ```
-
-2. Configure encryption (optional but recommended):
-   ```bash
-   # Create encryption key
-   gcloud kms keyrings create whatsapp-mcp \
-     --location=us-central1
-
-   gcloud kms keys create sessions-key \
-     --keyring=whatsapp-mcp \
-     --location=us-central1 \
-     --purpose=encryption
-
-   # Configure bucket encryption
-   gcloud storage buckets update gs://YOUR_PROJECT-whatsapp-sessions \
-     --default-kms-key=projects/YOUR_PROJECT/locations/us-central1/keyRings/whatsapp-mcp/cryptoKeys/sessions-key
-   ```
-
-### Option B: Supabase Session Storage (Recommended for Production)
-
-Store WhatsApp sessions in Supabase Postgres for better persistence and multi-instance support.
-
-**Step 1: Run Session Tables Migration**
+Enable these APIs before setting up Cloud Build:
 
 ```bash
-# Using Supabase SQL Editor (Recommended)
-# 1. Go to your Supabase project dashboard
-# 2. Navigate to SQL Editor
-# 3. Copy contents of ../whatsapp-mcp-server/migrations/010_create_whatsmeow_session_tables.sql
-# 4. Paste and execute
-
-# Or using psql
-psql "postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres" \
-  -f ../whatsapp-mcp-server/migrations/010_create_whatsmeow_session_tables.sql
+gcloud services enable \
+  cloudbuild.googleapis.com \
+  run.googleapis.com \
+  artifactregistry.googleapis.com \
+  secretmanager.googleapis.com \
+  sqladmin.googleapis.com
 ```
 
-**Step 2: Verify Tables**
+**API Purposes**:
+- `cloudbuild.googleapis.com` - Build automation and CI/CD
+- `run.googleapis.com` - Cloud Run service deployment
+- `artifactregistry.googleapis.com` - Container image storage
+- `secretmanager.googleapis.com` - Secure credential management
+- `sqladmin.googleapis.com` - Cloud SQL administration (if used)
 
-```sql
--- Check devices table exists
-SELECT to_regclass('public.devices');
+#### Required Secrets
 
--- Verify all 13 session tables exist
-SELECT count(*) FROM pg_tables
-WHERE schemaname = 'public'
-AND tablename IN ('devices', 'identities', 'prekeys', 'sessions', 'sender_keys',
-                  'signed_prekeys', 'app_state_sync_keys', 'app_state_version',
-                  'app_state_mutation_macs', 'contacts', 'chat_settings',
-                  'message_secrets', 'privacy_tokens');
--- Should return 13
+Create the following secrets in Secret Manager before deployment:
+
+**Required for all deployments:**
+```bash
+# OAuth Client ID (from Google Cloud Console)
+echo -n "YOUR_CLIENT_ID.apps.googleusercontent.com" | \
+  gcloud secrets create whatsapp-mcp-google-client-id \
+  --replication-policy="automatic" \
+  --data-file=-
 ```
 
-**Step 3: Create Secret for Session DSN**
+**When using PostgreSQL/Supabase for session storage:**
+```bash
+# Database connection string for session storage
+echo -n "postgresql://postgres:PASSWORD@db.PROJECT.supabase.co:5432/postgres?sslmode=require" | \
+  gcloud secrets create whatsapp-mcp-database-url \
+  --replication-policy="automatic" \
+  --data-file=-
+```
+
+**Note**: If using SQLite-only deployment (with GCS backup), you can either:
+- Omit the `DATABASE_URL` secret entirely and remove it from `cloudbuild.yaml`
+- Create a placeholder secret with value `sqlite::memory:` (not used but prevents deployment errors)
+
+See [SECRETS_REFERENCE.md](../SECRETS_REFERENCE.md) for complete secret configuration.
+
+#### Artifact Registry Setup
+
+Cloud Build pushes container images to Artifact Registry:
 
 ```bash
-# Create session DSN secret
-echo -n "postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres?sslmode=require" | \
-  gcloud secrets create whatsapp-mcp-session-dsn \
+# Create repository (if not exists)
+gcloud artifacts repositories create whatsapp-mcp \
+  --repository-format=docker \
+  --location=us-central1 \
+  --description="WhatsApp MCP Server container images"
+
+# Verify repository
+gcloud artifacts repositories describe whatsapp-mcp \
+  --location=us-central1
+```
+
+Repository URL format: `REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/IMAGE`
+
+#### IAM Roles for Cloud Build Service Account
+
+Grant the Cloud Build service account necessary permissions:
+
+```bash
+# Get Cloud Build service account email
+PROJECT_NUMBER=$(gcloud projects describe $(gcloud config get-value project) \
+  --format="value(projectNumber)")
+CLOUDBUILD_SA="${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
+
+# Grant required roles
+gcloud projects add-iam-policy-binding $(gcloud config get-value project) \
+  --member="serviceAccount:${CLOUDBUILD_SA}" \
+  --role="roles/run.admin"
+
+gcloud projects add-iam-policy-binding $(gcloud config get-value project) \
+  --member="serviceAccount:${CLOUDBUILD_SA}" \
+  --role="roles/iam.serviceAccountUser"
+
+gcloud projects add-iam-policy-binding $(gcloud config get-value project) \
+  --member="serviceAccount:${CLOUDBUILD_SA}" \
+  --role="roles/artifactregistry.writer"
+```
+
+**Roles Explained**:
+- `roles/run.admin` - Deploy and manage Cloud Run services
+- `roles/iam.serviceAccountUser` - Act as the runtime service account
+- `roles/artifactregistry.writer` - Push container images
+
+### Repository Connection Options
+
+Cloud Build supports two repository types:
+
+**Option A: GitHub (Recommended)**
+- Connect via GitHub App for secure access
+- Automatic webhook configuration
+- No code mirroring required
+- Best for external GitHub repositories
+
+**Option B: Cloud Source Repositories (CSR)**
+- Managed Git hosting on GCP
+- Native integration with Cloud Build
+- Requires repository mirroring or direct push
+- Best for internal projects or private repos
+
+### Automated Setup
+
+Use the provided setup script to automate Cloud Build configuration:
+
+```bash
+# Run automated setup
+./gcp/cloudbuild-setup.sh
+```
+
+**Available Flags**:
+- `--skip-trigger` or `--no-trigger` - Set up infrastructure without creating build trigger
+- `--help` or `-h` - Display usage information
+
+**Environment Variables**:
+- `REGION` - GCP region (default: `europe-west6`)
+- `REPOSITORY` - Artifact Registry repository name (default: `whatsapp-mcp`)
+- `SERVICE_NAME` - Cloud Run service name (default: `whatsapp-mcp-server`)
+
+**Examples**:
+```bash
+# Full setup with default settings
+./gcp/cloudbuild-setup.sh
+
+# Setup with custom region and service name
+REGION=us-central1 SERVICE_NAME=whatsapp-mcp ./gcp/cloudbuild-setup.sh
+
+# Infrastructure only, manual trigger later
+./gcp/cloudbuild-setup.sh --skip-trigger
+```
+
+The script performs:
+1. Validates prerequisites and authentication
+2. Enables required APIs
+3. Creates Artifact Registry repository
+4. Configures Cloud Build service account IAM
+5. Creates build trigger (unless `--skip-trigger` is set)
+6. Optionally tests manual build
+
+### Manual Trigger Creation
+
+If you skipped trigger creation or need to create additional triggers:
+
+#### Option A: GitHub Repository Trigger
+
+**Via gcloud CLI**:
+```bash
+# Prerequisites: Create GitHub App connection first
+# Visit: https://console.cloud.google.com/cloud-build/connections
+
+# Get connection and repository resource names
+CONNECTION_NAME="your-github-connection"
+REPO_NAME="your-repo"
+REGION="us-central1"
+
+# Full repository resource path
+REPOSITORY_RESOURCE="projects/${PROJECT_ID}/locations/${REGION}/connections/${CONNECTION_NAME}/repositories/${REPO_NAME}"
+
+# Create trigger
+gcloud builds triggers create github \
+  --name="whatsapp-mcp-main-trigger" \
+  --repository="${REPOSITORY_RESOURCE}" \
+  --branch-pattern="^main$" \
+  --build-config="cloudbuild.yaml" \
+  --region="${REGION}" \
+  --substitutions="_REGION=us-central1,_REPOSITORY=whatsapp-mcp,_SERVICE_NAME=whatsapp-mcp"
+```
+
+**Via Google Cloud Console**:
+1. Visit [Cloud Build Triggers](https://console.cloud.google.com/cloud-build/triggers)
+2. Click **Create Trigger**
+3. Configure:
+   - **Name**: `whatsapp-mcp-main-trigger`
+   - **Region**: Select your region (e.g., `us-central1`)
+   - **Event**: Push to branch
+   - **Source**: Select your GitHub connection and repository
+   - **Branch**: `^main$` (regex pattern)
+   - **Build Configuration**: Cloud Build configuration file
+   - **Location**: `cloudbuild.yaml`
+4. Add substitution variables:
+   - `_REGION`: `us-central1`
+   - `_REPOSITORY`: `whatsapp-mcp`
+   - `_SERVICE_NAME`: `whatsapp-mcp`
+5. Click **Create**
+
+**Setting up GitHub Connection** (required first):
+1. Visit [Cloud Build Connections](https://console.cloud.google.com/cloud-build/connections)
+2. Click **Create Connection**
+3. Select **GitHub** and follow OAuth flow
+4. Connect your repository through [Cloud Build Repositories](https://console.cloud.google.com/cloud-build/repositories)
+
+#### Option B: Cloud Source Repositories Trigger
+
+**Via gcloud CLI**:
+```bash
+# Prerequisites: Create CSR repository first
+gcloud source repos create whatsapp-mcp
+# Then push your code to CSR
+
+# Create trigger
+gcloud builds triggers create cloud-source-repositories \
+  --name="whatsapp-mcp-main-trigger" \
+  --repo="whatsapp-mcp" \
+  --branch-pattern="^main$" \
+  --build-config="cloudbuild.yaml" \
+  --region="us-central1" \
+  --substitutions="_REGION=us-central1,_REPOSITORY=whatsapp-mcp,_SERVICE_NAME=whatsapp-mcp"
+```
+
+**Via Google Cloud Console**:
+1. Create CSR repository:
+   ```bash
+   gcloud source repos create whatsapp-mcp
+   ```
+2. Visit [Cloud Build Triggers](https://console.cloud.google.com/cloud-build/triggers)
+3. Click **Create Trigger**
+4. Configure:
+   - **Name**: `whatsapp-mcp-main-trigger`
+   - **Region**: `us-central1`
+   - **Event**: Push to branch
+   - **Source**: Cloud Source Repository
+   - **Repository**: `whatsapp-mcp`
+   - **Branch**: `^main$`
+   - **Build Configuration**: `cloudbuild.yaml`
+5. Add substitution variables (same as GitHub option)
+
+**Verification Commands**:
+```bash
+# List all triggers
+gcloud builds triggers list --region=us-central1
+
+# Describe specific trigger
+gcloud builds triggers describe whatsapp-mcp-main-trigger --region=us-central1
+
+# Test trigger manually
+gcloud builds triggers run whatsapp-mcp-main-trigger --region=us-central1
+```
+
+### Understanding cloudbuild.yaml
+
+The `cloudbuild.yaml` file defines the build and deployment pipeline.
+
+#### Substitution Variables
+
+Customize behavior without editing the file:
+
+```yaml
+substitutions:
+  _REGION: us-central1              # Cloud Run deployment region
+  _REPOSITORY: whatsapp-mcp         # Artifact Registry repository
+  _SERVICE_NAME: whatsapp-mcp       # Cloud Run service name
+  _IMAGE_TAG: ${SHORT_SHA}          # Git commit SHA (auto-populated)
+  _SERVICE_ACCOUNT: whatsapp-mcp@${PROJECT_ID}.iam.gserviceaccount.com
+  _GCS_SESSION_BUCKET: ${PROJECT_ID}-whatsapp-sessions
+```
+
+Override when submitting builds:
+```bash
+gcloud builds submit \
+  --config=cloudbuild.yaml \
+  --substitutions=_REGION=europe-west1,_SERVICE_NAME=whatsapp-mcp-prod
+```
+
+#### Build Steps Explained
+
+**Step 1: Build Docker Image**
+```yaml
+- name: 'gcr.io/cloud-builders/docker'
+  id: 'build-image'
+  args: ['build', '-t', 'IMAGE_URL', '.']
+```
+Builds container from `Dockerfile`, tags with commit SHA and `latest`.
+
+**Step 2: Push to Artifact Registry**
+```yaml
+- name: 'gcr.io/cloud-builders/docker'
+  id: 'push-image-sha'
+  args: ['push', 'IMAGE_URL']
+```
+Uploads container images to Artifact Registry.
+
+**Step 3: Deploy to Cloud Run**
+```yaml
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  id: 'deploy-cloud-run'
+  entrypoint: 'gcloud'
+  args: ['run', 'deploy', ...]
+```
+Deploys the new image to Cloud Run with environment variables and secrets.
+
+#### Environment Variables
+
+Configured in the deploy step:
+```yaml
+--set-env-vars=\
+  MCP_TRANSPORT=sse,\
+  PORT=3000,\
+  WHATSAPP_BRIDGE_URL=http://localhost:8080,\
+  GCS_SESSION_BUCKET=${_GCS_SESSION_BUCKET},\
+  OAUTH_ENABLED=true,\
+  LOG_LEVEL=INFO
+```
+
+Modify these in `cloudbuild.yaml` or override via substitutions.
+
+#### Secrets Configuration
+
+Mounted from Secret Manager:
+```yaml
+--update-secrets=\
+  GOOGLE_CLIENT_ID=whatsapp-mcp-google-client-id:latest,\
+  DATABASE_URL=whatsapp-mcp-database-url:latest
+```
+
+Ensure secrets exist before deployment. See [Required Secrets](#required-secrets) above.
+
+#### Resource Settings
+
+```yaml
+--cpu=2                   # vCPUs allocated
+--memory=2Gi              # Memory allocation
+--min-instances=0         # Scale to zero when idle
+--max-instances=10        # Maximum concurrent instances
+--concurrency=80          # Requests per instance
+--timeout=300             # Request timeout (seconds)
+```
+
+Adjust based on workload requirements.
+
+#### Health Checks
+
+```yaml
+--startup-probe-path=/health    # Initial readiness check
+--liveness-probe-path=/health   # Ongoing health monitoring
+```
+
+The server must respond 200 OK at `/health` endpoint.
+
+#### Build Options
+
+```yaml
+options:
+  machineType: 'N1_HIGHCPU_8'     # Fast build machine
+  logging: CLOUD_LOGGING_ONLY      # Log destination
+  substitutionOption: 'ALLOW_LOOSE' # Allow missing substitutions
+timeout: 1800s                      # 30 minute build timeout
+```
+
+### Testing Cloud Build
+
+#### Local Docker Build (Pre-flight Check)
+
+```bash
+# Build locally to verify Dockerfile
+docker build -t whatsapp-mcp-test .
+
+# Test container locally
+docker run -p 3000:3000 \
+  -e OAUTH_ENABLED=false \
+  -e MCP_TRANSPORT=sse \
+  -e PORT=3000 \
+  whatsapp-mcp-test
+
+# Health check
+curl http://localhost:3000/health
+```
+
+#### Manual Build Submission
+
+```bash
+# Submit build manually (doesn't require trigger)
+gcloud builds submit \
+  --config=cloudbuild.yaml \
+  --region=us-central1 \
+  --substitutions=_REGION=us-central1,_REPOSITORY=whatsapp-mcp,_SERVICE_NAME=whatsapp-mcp
+
+# Monitor build progress
+gcloud builds list --ongoing --region=us-central1
+
+# View build logs
+BUILD_ID=$(gcloud builds list --region=us-central1 --limit=1 --format="value(id)")
+gcloud builds log ${BUILD_ID} --region=us-central1
+```
+
+#### Validate Deployment
+
+```bash
+# Check Cloud Run service
+gcloud run services describe whatsapp-mcp --region=us-central1
+
+# Get service URL
+SERVICE_URL=$(gcloud run services describe whatsapp-mcp \
+  --region=us-central1 \
+  --format="value(status.url)")
+
+# Test health endpoint
+curl "${SERVICE_URL}/health"
+
+# Check Artifact Registry images
+gcloud artifacts docker images list \
+  us-central1-docker.pkg.dev/$(gcloud config get-value project)/whatsapp-mcp/whatsapp-mcp
+```
+
+### Troubleshooting Cloud Build
+
+#### Build Fails: Permission Denied
+
+**Symptom**: Build fails with IAM permission errors.
+
+**Solution**:
+```bash
+# Verify Cloud Build SA has required roles
+PROJECT_NUMBER=$(gcloud projects describe $(gcloud config get-value project) \
+  --format="value(projectNumber)")
+CLOUDBUILD_SA="${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
+
+gcloud projects get-iam-policy $(gcloud config get-value project) \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:${CLOUDBUILD_SA}"
+
+# Re-grant roles if missing
+gcloud projects add-iam-policy-binding $(gcloud config get-value project) \
+  --member="serviceAccount:${CLOUDBUILD_SA}" \
+  --role="roles/run.admin"
+```
+
+#### Build Fails: Secret Not Found
+
+**Symptom**: `ERROR: Secret 'whatsapp-mcp-database-url' not found`
+
+**Solution**:
+```bash
+# Verify secret exists
+gcloud secrets describe whatsapp-mcp-database-url
+
+# If missing, create it
+echo -n "YOUR_DATABASE_URL" | \
+  gcloud secrets create whatsapp-mcp-database-url \
   --replication-policy="automatic" \
   --data-file=-
 
-# If already exists, add new version
-echo -n "postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres?sslmode=require" | \
-  gcloud secrets versions add whatsapp-mcp-session-dsn \
-  --data-file=-
-```
-
-**Step 4: Update Cloud Run Configuration**
-
-In your `cloudrun.yaml`, uncomment the session DSN environment variable:
-
-```yaml
-# Session database configuration
-- name: WHATSAPP_SESSION_DATABASE_URL
-  valueFrom:
-    secretKeyRef:
-      name: whatsapp-mcp-session-dsn
-      key: latest
-```
-
-**Step 5: Grant Service Account Access**
-
-```bash
-# Grant access to session DSN secret
-gcloud secrets add-iam-policy-binding whatsapp-mcp-session-dsn \
-  --member="serviceAccount:whatsapp-mcp@YOUR_PROJECT.iam.gserviceaccount.com" \
+# Grant Cloud Run service account access
+gcloud secrets add-iam-policy-binding whatsapp-mcp-database-url \
+  --member="serviceAccount:whatsapp-mcp@PROJECT_ID.iam.gserviceaccount.com" \
   --role="roles/secretmanager.secretAccessor"
 ```
 
-**Step 6: Verify Deployment**
+#### Build Fails: Artifact Registry Not Found
 
+**Symptom**: `ERROR: Repository 'whatsapp-mcp' not found`
+
+**Solution**:
 ```bash
-# Check bridge logs
+# Create repository
+gcloud artifacts repositories create whatsapp-mcp \
+  --repository-format=docker \
+  --location=us-central1
+
+# Verify creation
+gcloud artifacts repositories list --location=us-central1
+```
+
+#### Trigger Not Firing
+
+**Symptom**: Pushing to GitHub/CSR doesn't trigger build.
+
+**Solution**:
+```bash
+# Verify trigger exists and is active
+gcloud builds triggers list --region=us-central1
+
+# Check trigger configuration
+gcloud builds triggers describe whatsapp-mcp-main-trigger --region=us-central1
+
+# For GitHub: Verify webhook is configured
+# Visit: https://console.cloud.google.com/cloud-build/repositories
+
+# Test trigger manually
+gcloud builds triggers run whatsapp-mcp-main-trigger --region=us-central1
+```
+
+#### Deployment Succeeds but Service Unhealthy
+
+**Symptom**: Build completes but Cloud Run service fails health checks.
+
+**Solution**:
+```bash
+# Check Cloud Run logs
 gcloud run services logs read whatsapp-mcp --region=us-central1 --limit=50
 
-# Look for:
-# "Using Postgres session store"
-# "Postgres session DSN host: db.[PROJECT-REF].supabase.co"
-# "✓ Session tables validated successfully"
+# Common issues:
+# 1. Missing environment variables
+# 2. Secret access denied
+# 3. Bridge not starting (WHATSAPP_BRIDGE_URL misconfigured)
+# 4. Database connection failure
 
-# Check session backend status via API
-curl https://[YOUR-SERVICE-URL]/api/session-backend
+# Verify secrets are accessible
+gcloud secrets get-iam-policy whatsapp-mcp-google-client-id
+
+# Test service manually
+SERVICE_URL=$(gcloud run services describe whatsapp-mcp \
+  --region=us-central1 --format="value(status.url)")
+curl -v "${SERVICE_URL}/health"
 ```
 
-**Notes:**
+#### Build Times Out
 
-- GCS session backup is automatically disabled when using Postgres sessions
-- Use Supabase's built-in backups or `pg_dump` for session backup
-- Session tables have RLS enabled with deny-all policies for security
-- Only the Go bridge (using direct Postgres connection) can access session tables
-- For complete documentation, see `../whatsapp-mcp-server/migrations/README.md`
+**Symptom**: `ERROR: Build timed out after 1800s`
 
-## Service Account Setup
-
-1. Create dedicated service account:
-   ```bash
-   # Create service account
-   gcloud iam service-accounts create whatsapp-mcp \
-     --display-name="WhatsApp MCP Server"
-   
-   # Get the full service account email
-   SA_EMAIL="whatsapp-mcp@YOUR_PROJECT.iam.gserviceaccount.com"
-   ```
-
-2. Grant required permissions:
-   ```bash
-   # Secret Manager access
-   gcloud secrets add-iam-policy-binding whatsapp-mcp-google-client-id \
-     --member="serviceAccount:$SA_EMAIL" \
-     --role="roles/secretmanager.secretAccessor"
-   
-   gcloud secrets add-iam-policy-binding whatsapp-mcp-oauth-audience \
-     --member="serviceAccount:$SA_EMAIL" \
-     --role="roles/secretmanager.secretAccessor"
-   
-   # GCS bucket access
-   gcloud storage buckets add-iam-policy-binding \
-     gs://YOUR_PROJECT-whatsapp-sessions \
-     --member="serviceAccount:$SA_EMAIL" \
-     --role="roles/storage.objectViewer"
-   
-   gcloud storage buckets add-iam-policy-binding \
-     gs://YOUR_PROJECT-whatsapp-sessions \
-     --member="serviceAccount:$SA_EMAIL" \
-     --role="roles/storage.objectCreator"
-   ```
-
-## Cloud Run Deployment
-
-1. Build and push container:
-   ```bash
-   # Build with Cloud Build
-   gcloud builds submit \
-     --tag gcr.io/YOUR_PROJECT/whatsapp-mcp
-   ```
-
-2. Deploy to Cloud Run:
-   ```bash
-   # Deploy service
-   gcloud run deploy whatsapp-mcp \
-     --image gcr.io/YOUR_PROJECT/whatsapp-mcp \
-     --region us-central1 \
-     --service-account $SA_EMAIL \
-     --port 3000 \
-     --memory 512Mi \
-     --cpu 1 \
-     --min-instances 0 \
-     --max-instances 10 \
-     --set-env-vars "MCP_TRANSPORT=sse" \
-     --set-secrets "GOOGLE_CLIENT_ID=whatsapp-mcp-google-client-id:latest" \
-     --set-secrets "OAUTH_AUDIENCE=whatsapp-mcp-oauth-audience:latest" \
-     --allow-unauthenticated
-   ```
-
-## Health Checks and Monitoring
-
-1. Health check endpoint:
-   - Cloud Run automatically probes `/health`
-   - Endpoint bypasses OAuth authentication
-   - Returns HTTP 200 OK when service is healthy
-
-2. Set up monitoring:
-   ```bash
-   # Create uptime check
-   gcloud monitoring uptime-checks create http whatsapp-mcp \
-     --uri="https://YOUR-SERVICE-xxxxx-uc.a.run.app/health" \
-     --period=300s \
-     --timeout=10s
-   
-   # Create alerting policy (recommended)
-   gcloud alpha monitoring policies create \
-     --notification-channels="projects/YOUR_PROJECT/notificationChannels/YOUR_CHANNEL" \
-     --display-name="WhatsApp MCP Server Health" \
-     --conditions="metric.type=\"run.googleapis.com/request_count\" resource.type=\"cloud_run_revision\" metric.label.response_code_class!=\"2xx\""
-   ```
-
-## MCP Client Configuration
-
-After deploying to Cloud Run, configure your MCP clients to connect to the remote server:
-
-### Claude Desktop
-
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "whatsapp-remote": {
-      "transport": "sse",
-      "url": "https://YOUR-SERVICE-xxxxx-uc.a.run.app/sse",
-      "headers": {
-        "Authorization": "Bearer YOUR_GOOGLE_ID_TOKEN"
-      }
-    }
-  }
-}
-```
-
-### Cursor
-
-Edit `~/.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "whatsapp-remote": {
-      "transport": "sse",
-      "url": "https://YOUR-SERVICE-xxxxx-uc.a.run.app/sse",
-      "headers": {
-        "Authorization": "Bearer YOUR_GOOGLE_ID_TOKEN"
-      }
-    }
-  }
-}
-```
-
-### Obtaining Tokens
-
+**Solution**:
 ```bash
-# Get Google ID token for your OAuth Client ID
-gcloud auth print-identity-token --audiences=YOUR_CLIENT_ID.apps.googleusercontent.com
+# Increase timeout in cloudbuild.yaml
+# Edit: timeout: 3600s  # 60 minutes
+
+# Or use faster machine type
+# Edit options.machineType: 'E2_HIGHCPU_32'
+
+# Check for slow steps
+gcloud builds log BUILD_ID --region=us-central1
 ```
 
-**Note**: Tokens expire after 1 hour and must be refreshed manually or via automation.
+#### Substitution Variable Errors
 
-## Cost Optimization
+**Symptom**: `ERROR: Substitution variable '_REGION' not found`
 
-Monthly cost estimates for WhatsApp MCP on Cloud Run:
-
-### Development (~$0-5/month)
-- **Cloud Run**: Free tier (2M requests/month)
-- **Cloud Storage**: 5GB free tier
-- **Secret Manager**: 6 secrets, free tier
-- **Total**: $0-5 if within free tiers
-
-### Production Low Traffic (~$10-35/month)
-- **Cloud Run**: ~100K requests, min-instances=0 - $5-10
-- **Cloud Storage**: 10GB - $0.20
-- **Secret Manager**: 6 secrets - $0.06
-- **Supabase**: Free tier or $25/month Pro
-- **Total**: $10-35/month
-
-### Production High Availability (~$75-125/month)
-- **Cloud Run**: ~1M requests, min-instances=1 - $50-100
-- **Cloud Storage**: 50GB + backups - $1
-- **Secret Manager**: 10 secrets with rotation - $0.10
-- **Supabase Pro**: $25/month
-- **Total**: $75-125/month
-
-### Cost Optimization Tips
-
-1. Instance configuration:
-   - Start with minimal resources (512Mi memory, 1 CPU)
-   - Set min-instances=0 for cost savings
-   - Adjust max-instances based on load
-   - Monitor actual usage and adjust
-
-2. Scaling configuration:
-   ```bash
-   # Update scaling configuration
-   gcloud run services update whatsapp-mcp \
-     --min-instances=0 \
-     --max-instances=10 \
-     --cpu-throttling \
-     --concurrency=80
-   ```
-
-3. Cost monitoring:
-   ```bash
-   # Set up budget alert
-   gcloud billing budgets create \
-     --billing-account=YOUR_BILLING_ACCOUNT \
-     --display-name="WhatsApp MCP Budget" \
-     --budget-amount=50USD \
-     --threshold-rule=percent=0.8 \
-     --threshold-rule=percent=1.0
-   ```
-
-4. Additional optimizations:
-   - Use GCS lifecycle policies to archive old session data
-   - Implement request caching to reduce Cloud Run costs
-   - Monitor and optimize API usage patterns
-   - Leverage free tiers for development/testing
-
-## Security Best Practices
-
-### IAM Roles and Permissions
-
-Configure the Cloud Run service account with minimal required roles:
-
+**Solution**:
 ```bash
-# Required roles for the service account
-gcloud projects add-iam-policy-binding PROJECT_ID \
-  --member="serviceAccount:whatsapp-mcp-sa@PROJECT_ID.iam.gserviceaccount.com" \
-  --role="roles/secretmanager.secretAccessor"
+# Ensure all required substitutions are provided
+gcloud builds submit \
+  --config=cloudbuild.yaml \
+  --substitutions=_REGION=us-central1,_REPOSITORY=whatsapp-mcp,_SERVICE_NAME=whatsapp-mcp
 
-# Grant storage permissions at bucket level (not project level)
-gcloud storage buckets add-iam-policy-binding \
-  gs://PROJECT_ID-whatsapp-sessions \
-  --member="serviceAccount:whatsapp-mcp-sa@PROJECT_ID.iam.gserviceaccount.com" \
-  --role="roles/storage.objectAdmin"
+# Or set defaults in cloudbuild.yaml substitutions section
 ```
 
-**Avoid granting**:
-- Project-level Editor or Owner roles
-- Overly broad storage permissions
-- Unnecessary Cloud SQL or compute permissions
-
-### OAuth Configuration
-
-1. **Use internal user type when possible**:
-   - Limits access to organization members only
-   - Reduces attack surface for token theft
-
-2. **Token security**:
-   - Never commit tokens to version control
-   - Use short-lived tokens (1 hour expiry)
-   - Implement automatic token refresh
-   - Monitor OAuth usage in audit logs
-
-3. **Client ID protection**:
-   - Store Client ID in Secret Manager
-   - Rotate credentials if compromised
-   - Use separate Client IDs per environment
-
-### Secrets Management
-
-1. **Secret rotation cadence**:
-   - OAuth credentials: Rotate every 90 days
-   - Supabase keys: Rotate every 180 days
-   - Review and rotate on security incidents
-
-2. **Enable audit logging**:
-   ```bash
-   # Enable Data Access audit logs for Secret Manager
-   # Via Cloud Console: IAM & Admin → Audit Logs → Secret Manager
-   # Enable: Admin Read, Data Read, Data Write
-   ```
-
-3. **Secret access monitoring**:
-   ```bash
-   # Monitor secret access logs
-   gcloud logging read \
-     "resource.type=secretmanager.googleapis.com/Secret \
-      AND protoPayload.methodName=google.cloud.secretmanager.v1.SecretManagerService.AccessSecretVersion" \
-     --limit=50
-   ```
-
-### Network Security
-
-1. **Ingress controls**:
-   ```bash
-   # Restrict to internal + load balancer only
-   gcloud run services update whatsapp-mcp \
-     --ingress=internal-and-cloud-load-balancing \
-     --execution-environment=gen2
-   ```
-
-2. **VPC Service Controls** (optional, advanced):
-   - Create a service perimeter around Secret Manager and Storage
-   - Restricts data exfiltration
-   - Requires VPC-SC setup
-
-3. **Cloud Armor** (optional, for DDoS protection):
-   - Deploy Cloud Load Balancer in front of Cloud Run
-   - Configure Cloud Armor security policies
-   - Rate limiting and geo-blocking
-
-### Service Hardening
-
+**Useful Debugging Commands**:
 ```bash
-# Enable Binary Authorization (optional, requires setup)
-gcloud run services update whatsapp-mcp \
-  --binary-authorization=default
+# List recent builds
+gcloud builds list --region=us-central1 --limit=10
 
-# Use Gen2 execution environment
-gcloud run services update whatsapp-mcp \
-  --execution-environment=gen2
+# View detailed build log
+gcloud builds log BUILD_ID --region=us-central1
 
-# Limit service account scope
-gcloud run services update whatsapp-mcp \
-  --no-allow-unauthenticated  # If using IAM auth
+# Check service health
+gcloud run services describe whatsapp-mcp --region=us-central1
+
+# View Cloud Run logs
+gcloud run services logs read whatsapp-mcp --region=us-central1
+
+# Test local build
+docker build -t test-image .
+docker run -p 3000:3000 -e OAUTH_ENABLED=false test-image
 ```
 
-### Monitoring and Alerting
+**Console Links**:
+- [Cloud Build History](https://console.cloud.google.com/cloud-build/builds)
+- [Cloud Build Triggers](https://console.cloud.google.com/cloud-build/triggers)
+- [Connections & Repositories](https://console.cloud.google.com/cloud-build/repositories)
+- [Artifact Registry](https://console.cloud.google.com/artifacts)
+- [Secret Manager](https://console.cloud.google.com/security/secret-manager)
+- [Cloud Run Services](https://console.cloud.google.com/run)
 
-1. **Enable Cloud Logging exports**:
-   ```bash
-   # Export logs to BigQuery for long-term analysis
-   gcloud logging sinks create whatsapp-mcp-logs \
-     bigquery.googleapis.com/projects/PROJECT_ID/datasets/whatsapp_logs \
-     --log-filter='resource.type="cloud_run_revision" \
-                   AND resource.labels.service_name="whatsapp-mcp"'
-   ```
+---
 
-2. **Set up security alerts**:
-   - Alert on failed OAuth attempts
-   - Monitor unusual secret access patterns
-   - Track unauthorized API calls
+## Quick Links
 
-3. **Regular security reviews**:
-   - Review IAM permissions monthly
-   - Audit secret access logs weekly
-   - Check for unused service accounts
+- **[Main README](../README.md)** - Getting started and local setup
+- **[Database Configuration](../docs/database.md)** - SQLite, PostgreSQL, Supabase options
+- **[Migrations Guide](../docs/migrations.md)** - Database schema setup
+- **[Environment Variables](../SECRETS_REFERENCE.md)** - Complete secrets reference
+- **[Troubleshooting](../docs/troubleshooting.md)** - Common issues
 
-## Troubleshooting
+## Legacy Files (Archived)
 
-1. Check service health:
-   ```bash
-   # View service status
-   gcloud run services describe whatsapp-mcp
-   
-   # Check recent logs
-   gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=whatsapp-mcp" --limit=50
-   ```
+The following files have been consolidated into the main deployment guide:
 
-2. Common issues:
-   - OAuth configuration
-   - Secret access
-   - Storage permissions
-   - Memory/CPU limits
-   - Network connectivity
+- `DATABASE_SETUP.md` → See [docs/deployment/cloud-run.md#database-setup](../docs/deployment/cloud-run.md#database-setup)
+- `API_REQUIREMENTS.md` → See [docs/deployment/cloud-run.md#prerequisites](../docs/deployment/cloud-run.md#prerequisites)
+- `env-template.yaml` - Still available for reference
 
-3. Debug tools:
-   ```bash
-   # Test service locally
-   PORT=3000 OAUTH_ENABLED=true docker run --rm -p 3000:3000 gcr.io/YOUR_PROJECT/whatsapp-mcp
-   
-   # Validate service account permissions
-   gcloud beta asset analyze-iam-policy \
-     --identity="serviceAccount:$SA_EMAIL" \
-     --permissions="secretmanager.versions.access,storage.objects.get"
-   ```
+## Helper Scripts
 
-## Maintenance
+This directory contains useful automation scripts:
 
-1. Regular updates:
-   - Keep base images updated
-   - Apply security patches
-   - Update dependencies
-   - Monitor Cloud Run announcements
+- **`setup.sh`** - Automated GCP resource provisioning
+- **`terraform/`** - Infrastructure as code for Cloud Run deployment
 
-2. Backup strategy:
-   - Regular session exports
-   - Database backups
-   - Configuration backups
-
-3. Monitoring strategy:
-   - Set up logging exports
-   - Configure error reporting
-   - Track performance metrics
-   - Set up alerts
+See the [deployment guide](../docs/deployment/cloud-run.md) for usage instructions.

@@ -10,7 +10,6 @@ import (
 	"io"
 	"math"
 	"math/rand"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -226,6 +225,7 @@ func NewMessageStore(db *sql.DB, driverName string) (*MessageStore, error) {
 
 	// Validate that required tables exist
 	var missingTables []string
+	var err error
 
 	if driverName == "postgres" {
 		// For PostgreSQL, use to_regclass with explicit schema to check table existence
@@ -372,7 +372,8 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 		store.makePlaceholder(1), store.makePlaceholder(2),
 	)
 
-	rows, err := store.db.Query(query, chatJID, limit)
+
+rows, err := store.db.Query(query, chatJID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -397,7 +398,8 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	query := "SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC"
 
-	rows, err := store.db.Query(query)
+
+rows, err := store.db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -1411,17 +1413,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 </body>
 </html>`
 
-		tmpl, err := template.New("qr").Parse(qrTemplate)
-		if err != nil {
-			http.Error(w, "Template error", http.StatusInternalServerError)
-			return
-		}
+	tmpl, err := template.New("qr").Parse(qrTemplate)
+	if err != nil {
+		http.Error(w, "Template error", http.StatusInternalServerError)
+		return
+	}
 
 		// Properly escape QR code for JavaScript template
-		escapedQR := strings.ReplaceAll(qrCode, `\`, `\\`)
-		escapedQR = strings.ReplaceAll(escapedQR, `"`, `\"`)
-		escapedQR = strings.ReplaceAll(escapedQR, "\n", "\\n")
-		escapedQR = strings.ReplaceAll(escapedQR, "\r", "\\r")
+	escapedQR := strings.ReplaceAll(qrCode, `\`, `\\`)
+	escapedQR = strings.ReplaceAll(escapedQR, `"`, `\"`)
+	escapedQR = strings.ReplaceAll(escapedQR, "\n", "\\n")
+	escapedQR = strings.ReplaceAll(escapedQR, "\r", "\\r")
 
 		data := struct {
 			QRCode string
@@ -1537,11 +1539,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		response := map[string]interface{}{
-			"backend":            sessionCfg.DriverName,
-			"session_tables_ok":  false,
-			"message_backend":    "unknown",
-			"message_tables_ok":  false,
-			"errors":             []string{},
+			"backend":           sessionCfg.DriverName,
+			"session_tables_ok": false,
+			"message_backend":   "unknown",
+			"message_tables_ok": false,
+			"errors":            []string{},
 		}
 
 		// Check session backend tables
@@ -1657,8 +1659,6 @@ func main() {
 		}
 		logger.Infof("Postgres session DSN host: %s", dsnHost)
 
-
-
 		// Open temporary connection to validate session tables exist
 		logger.Infof("Validating Postgres session tables...")
 		testDB, err := sql.Open(sessionConfig.DriverName, sessionConfig.DataSourceName)
@@ -1730,17 +1730,11 @@ func main() {
 
 	fmt.Printf("Session store using driver: %s\n", sessionConfig.DriverName)
 
-	sessionDB, err := openDatabaseWithIPv4(sessionConfig)
-	if err != nil {
-		logger.Errorf("Failed to open session database: %v", err)
-		return
-	}
-	container, err := sqlstore.New(sessionConfig.DriverName, sessionConfig.DataSourceName, dbLog)
+	container, err := sqlstore.New(context.Background(), sessionConfig.DriverName, sessionConfig.DataSourceName, dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
-	container.DB = sessionDB
 
 	// Get device store - This contains session information
 	deviceStore, err := container.GetFirstDevice(context.Background())
@@ -1764,7 +1758,7 @@ func main() {
 
 	// Initialize message store
 	messageConfig := getDatabaseConfig("DATABASE_URL", "sqlite3", "file:store/messages.db?_foreign_keys=on")
-	messageDB, err := openDatabaseWithIPv4(messageConfig)
+	messageDB, err := sql.Open(messageConfig.DriverName, messageConfig.DataSourceName)
 	if err != nil {
 		logger.Errorf("Failed to open message database: %v", err)
 		return
@@ -1847,15 +1841,15 @@ func main() {
 				authMutex.Unlock()
 
 				// Upload session to GCS after successful authentication (SQLite only)
-				if gcsBucket != "" {
-					if sessionConfig.DriverName == "sqlite3" {
-						go func() {
-							// Extract local SQLite path from DSN
-							localPath := sessionConfig.DataSourceName
-							localPath = strings.TrimPrefix(localPath, "file:")
-							if idx := strings.Index(localPath, "?"); idx >= 0 {
-								localPath = localPath[:idx]
-							}
+			if gcsBucket != "" {
+				if sessionConfig.DriverName == "sqlite3" {
+					go func() {
+						// Extract local SQLite path from DSN
+						localPath := sessionConfig.DataSourceName
+						localPath = strings.TrimPrefix(localPath, "file:")
+						if idx := strings.Index(localPath, "?"); idx >= 0 {
+							localPath = localPath[:idx]
+						}
 
 							logger.Infof("Uploading session to GCS after authentication")
 							if err := uploadSessionToGCS(context.Background(), gcsBucket, gcsObjectName, localPath, logger); err != nil {
@@ -1942,35 +1936,6 @@ func main() {
 	client.Disconnect()
 }
 
-func openDatabaseWithIPv4(config DatabaseConfig) (*sql.DB, error) {
-	if config.DriverName != "postgres" {
-		return sql.Open(config.DriverName, config.DataSourceName)
-	}
-
-	// Create a custom dialer that forces IPv4
-	dialer := &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-		DualStack: false, // Explicitly disable dual-stack to prevent IPv6 attempts
-	}
-
-	// Wrap the dialer to ensure "tcp4" is used
-	connector, err := pq.NewConnector(config.DataSourceName)
-	if err != nil {
-		return nil, fmt.Errorf("error creating pq connector: %v", err)
-	}
-
-	type dialerFunc func(ctx context.Context, network, addr string) (net.Conn, error)
-	connector.Dialer(dialerFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
-		// Force the network to "tcp4"
-		return dialer.DialContext(ctx, "tcp4", addr)
-	}))
-
-	// Open the database connection using the custom connector
-	db := sql.OpenDB(connector)
-	return db, nil
-}
-
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
@@ -2007,9 +1972,9 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 				}
 
 				// Try to find Name field
-				if nameField := v.FieldByName("Name"); nameField.IsValid() && nameField.Kind() == reflect.Ptr && !nameField.IsNil() {
-					n := nameField.Elem().String()
-					convName = &n
+			if nameField := v.FieldByName("Name"); nameField.IsValid() && nameField.Kind() == reflect.Ptr && !nameField.IsNil() {
+				n := nameField.Elem().String()
+				convName = &n
 				}
 			}
 
@@ -2155,41 +2120,41 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Get message timestamp
-				timestamp := time.Time{}
-				if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
-					timestamp = time.Unix(int64(ts), 0)
-				} else {
-					continue
-				}
+			timestamp := time.Time{}
+			if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
+				timestamp = time.Unix(int64(ts), 0)
+			} else {
+				continue
+			}
 
 				err = messageStore.StoreMessage(
 					msgID,
 					chatJID,
-					sender,
-					content,
-					timestamp,
-					isFromMe,
-					mediaType,
-					filename,
-					url,
-					mediaKey,
-					fileSHA256,
-					fileEncSHA256,
-					fileLength,
-				)
-				if err != nil {
-					logger.Warnf("Failed to store history message: %v", err)
+				sender,
+				content,
+				timestamp,
+				isFromMe,
+				mediaType,
+				filename,
+				url,
+				mediaKey,
+				fileSHA256,
+				fileEncSHA256,
+				fileLength,
+			)
+			if err != nil {
+				logger.Warnf("Failed to store history message: %v", err)
+			} else {
+				syncedCount++
+				// Log successful message storage
+				if mediaType != "" {
+					logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
+						timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
 				} else {
-					syncedCount++
-					// Log successful message storage
-					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
-					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
-					}
+					logger.Infof("Stored message: [%s] %s -> %s: %s",
+						timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
 				}
+			}
 			}
 		}
 	}
@@ -2262,7 +2227,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		}
 
 		// Extract header fields
-		granulePos := binary.LittleEndian.Uint64(data[i+6 : i+14])
+	granulePos := binary.LittleEndian.Uint64(data[i+6 : i+14])
 		pageSeqNum := binary.LittleEndian.Uint32(data[i+18 : i+22])
 		numSegments := int(data[i+26])
 

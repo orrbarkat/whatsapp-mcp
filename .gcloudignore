@@ -1,0 +1,117 @@
+# This file specifies files that are *not* uploaded to Google Cloud
+# using gcloud. It follows the same syntax as .gitignore, with the addition of
+# "#!include" directives (which insert the entries of the given .gitignore-style
+# file at that point).
+#
+# For more information, run:
+#   $ gcloud topic gcloudignore
+#
+.gcloudignore
+# If you would like to upload your .git directory, .gitignore file or files
+# from your .gitignore file, remove the corresponding line below:
+.git
+.gitignore
+
+# Python pycache:
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+**/.venv/
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Local data
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Documentation (not needed for builds)
+docs/
+*.md.archived
+DOCUMENTATION_CONSOLIDATION.md
+
+# Archived files
+*.archived
+
+# Test files
+test/
+tests/
+*_test.go
+*_test.py
+
+# CI/CD (keep cloudbuild.yaml)
+.github/
+
+# Environment files (secrets should be in Secret Manager)
+.env
+.env.*
+
+# Go test binaries
+*.test
+
+# Node modules if any
+node_modules/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Keep these files (using negation pattern):
+!Dockerfile
+!cloudbuild.yaml
+!requirements.txt
+!pyproject.toml
+!go.mod
+!go.sum
+!whatsapp-mcp-server/
+!whatsapp-bridge/
+!gcp/cloudrun.yaml
+!migrations/

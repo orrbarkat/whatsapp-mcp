@@ -25,3 +25,4 @@ gcp/service-account-key.json
 gcp/**/*.json
 gcp/generated-env.yaml
 gcp/.gcloud/
+gcp/*.log

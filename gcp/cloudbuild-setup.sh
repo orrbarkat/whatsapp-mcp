@@ -7,9 +7,10 @@ set -euo pipefail
 
 # Configuration
 SCRIPT_NAME="$(basename "$0")"
-REGION="${REGION:-us-central1}"
+REGION="${REGION:-europe-west6}"
 REPOSITORY="${REPOSITORY:-whatsapp-mcp}"
 SERVICE_NAME="${SERVICE_NAME:-whatsapp-mcp-server}"
+SKIP_TRIGGER=false
 
 # Colors for output
 RED='\033[0;31m'
@@ -33,6 +34,76 @@ log_warning() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $*" | tee -a "${LOG_FILE}"
+}
+
+# Show usage information
+show_usage() {
+    cat <<EOF
+Usage: ${SCRIPT_NAME} [OPTIONS]
+
+Cloud Build Setup Script for WhatsApp MCP Server
+This script configures Cloud Build triggers, IAM permissions, and Artifact Registry
+for automated deployment of the WhatsApp MCP Server to Google Cloud Run.
+
+OPTIONS:
+  --skip-trigger, --no-trigger    Skip Cloud Build trigger creation
+                                  (useful when setting up infrastructure without
+                                  configuring GitHub/CSR repository connections)
+  --help, -h                      Show this help message and exit
+
+EXAMPLES:
+  # Full setup including triggers
+  ${SCRIPT_NAME}
+
+  # Setup infrastructure only, skip trigger creation
+  ${SCRIPT_NAME} --skip-trigger
+
+  # Setup with custom region and repository
+  REGION=us-central1 REPOSITORY=my-repo ${SCRIPT_NAME}
+
+PREREQUISITES:
+  1. gcloud CLI installed and authenticated (gcloud auth login)
+  2. Active GCP project configured (gcloud config set project PROJECT_ID)
+  3. Required APIs will be enabled automatically:
+     - cloudbuild.googleapis.com
+     - run.googleapis.com
+     - artifactregistry.googleapis.com
+     - sqladmin.googleapis.com
+     - secretmanager.googleapis.com
+  4. For GitHub triggers: GitHub App connection configured in Cloud Build
+     (https://console.cloud.google.com/cloud-build/connections)
+  5. For CSR triggers: Cloud Source Repository created
+     (gcloud source repos create whatsapp-mcp)
+
+ENVIRONMENT VARIABLES:
+  REGION         GCP region for resources (default: europe-west6)
+  REPOSITORY     Artifact Registry repository name (default: whatsapp-mcp)
+  SERVICE_NAME   Cloud Run service name (default: whatsapp-mcp-server)
+
+For more information, see: gcp/README.md
+EOF
+}
+
+# Parse command line arguments
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --skip-trigger|--no-trigger)
+                SKIP_TRIGGER=true
+                shift
+                ;;
+            --help|-h)
+                show_usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                echo ""
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
 }
 
 # Get project information
@@ -136,6 +207,30 @@ create_artifact_registry() {
     log_success "Repository URL: ${repo_url}"
 }
 
+# Validate Artifact Registry exists
+validate_artifact_registry() {
+    log_info "Validating Artifact Registry repository..."
+
+    if ! gcloud artifacts repositories describe "${REPOSITORY}" \
+        --location="${REGION}" \
+        --project="${PROJECT_ID}" &>/dev/null; then
+        log_error "Artifact Registry repository '${REPOSITORY}' does not exist in region '${REGION}'"
+        log_error ""
+        log_error "To fix this issue, either:"
+        log_error "  1. Run the full setup without --skip-trigger flag to create the repository:"
+        log_error "     ${SCRIPT_NAME}"
+        log_error ""
+        log_error "  2. Or create the repository manually:"
+        log_error "     gcloud artifacts repositories create ${REPOSITORY} \\"
+        log_error "       --repository-format=docker \\"
+        log_error "       --location=${REGION} \\"
+        log_error "       --project=${PROJECT_ID}"
+        exit 1
+    fi
+
+    log_success "Artifact Registry repository validated: ${REPOSITORY}"
+}
+
 # Grant IAM permissions to Cloud Build service account
 grant_cloudbuild_permissions() {
     log_info "Configuring Cloud Build service account IAM permissions..."
@@ -178,18 +273,29 @@ grant_cloudbuild_permissions() {
 
 # Create Cloud Build trigger
 create_cloudbuild_trigger() {
+    # Early return if SKIP_TRIGGER is set
+    if [[ "${SKIP_TRIGGER}" == "true" ]]; then
+        log_info "Skipping Cloud Build trigger creation (--skip-trigger flag set)"
+        return 0
+    fi
+
     log_info "Configuring Cloud Build trigger..."
+
+    # Validate that Artifact Registry exists before creating triggers
+    validate_artifact_registry
 
     local trigger_name="whatsapp-mcp-main-trigger"
 
-    # Check if trigger already exists
+    # Check if trigger already exists (with consistent region usage)
     if gcloud builds triggers describe "${trigger_name}" \
+        --region="${REGION}" \
         --project="${PROJECT_ID}" &>/dev/null; then
         log_warning "Trigger already exists: ${trigger_name}"
         log_info "Updating existing trigger..."
 
-        # Delete and recreate to ensure correct configuration
+        # Delete and recreate to ensure correct configuration (with consistent region usage)
         gcloud builds triggers delete "${trigger_name}" \
+            --region="${REGION}" \
             --project="${PROJECT_ID}" \
             --quiet
         log_info "Deleted existing trigger"
@@ -203,38 +309,165 @@ create_cloudbuild_trigger() {
     github_connections=$(gcloud builds connections list --region="${REGION}" --project="${PROJECT_ID}" --format="value(name)" 2>/dev/null || echo "")
 
     if [[ -n "${github_connections}" ]]; then
-        log_info "GitHub connections found. Creating GitHub trigger..."
+        # Handle GitHub connections
+        local connections_array=()
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && connections_array+=("$line")
+        done <<< "${github_connections}"
 
-        # Get repository information
-        local repo_owner repo_name
-        read -rp "Enter GitHub repository owner: " repo_owner
-        read -rp "Enter GitHub repository name: " repo_name
+        local connection_name=""
+        local num_connections=${#connections_array[@]}
 
-        gcloud builds triggers create github \
+        if [[ ${num_connections} -eq 0 ]]; then
+            # This shouldn't happen due to the outer check, but handle it anyway
+            log_error "No GitHub App connections found."
+            log_error ""
+            log_error "A GitHub App connection is required to create triggers for GitHub-hosted repositories."
+            log_error "To fix this issue, choose one of the following options:"
+            log_error ""
+            log_error "  1. Create a GitHub App connection in the Cloud Build console:"
+            log_error "     https://console.cloud.google.com/cloud-build/connections"
+            log_error ""
+            log_error "  2. Use Cloud Source Repositories instead (requires creating a CSR repo):"
+            log_error "     gcloud source repos create whatsapp-mcp"
+            log_error ""
+            log_error "  3. Skip trigger creation for now and set up manually later:"
+            log_error "     ${SCRIPT_NAME} --skip-trigger"
+            exit 1
+        elif [[ ${num_connections} -eq 1 ]]; then
+            connection_name="${connections_array[0]}"
+            log_info "Found one GitHub connection: ${connection_name}"
+        else
+            log_info "Found ${num_connections} GitHub connections:"
+            for i in "${!connections_array[@]}"; do
+                echo "  $((i+1)). ${connections_array[i]}"
+            done
+            echo ""
+            read -rp "Select connection number (1-${num_connections}): " selection
+
+            if [[ ! "${selection}" =~ ^[0-9]+$ ]] || [[ ${selection} -lt 1 ]] || [[ ${selection} -gt ${num_connections} ]]; then
+                log_error "Invalid selection. Exiting."
+                exit 1
+            fi
+
+            connection_name="${connections_array[$((selection-1))]}"
+            log_info "Selected connection: ${connection_name}"
+        fi
+
+        # Get the list of repositories for this connection
+        local repositories
+        repositories=$(gcloud builds repositories list --connection="${connection_name}" --region="${REGION}" --project="${PROJECT_ID}" --format="value(name)" 2>/dev/null || echo "")
+
+        if [[ -z "${repositories}" ]]; then
+            log_error "No repositories found for connection '${connection_name}'"
+            log_error ""
+            log_error "Please connect a repository to this GitHub App connection:"
+            log_error "  https://console.cloud.google.com/cloud-build/repositories"
+            log_error ""
+            log_error "Or skip trigger creation for now:"
+            log_error "  ${SCRIPT_NAME} --skip-trigger"
+            exit 1
+        fi
+
+        local repositories_array=()
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && repositories_array+=("$line")
+        done <<< "${repositories}"
+
+        local repo_name=""
+        local num_repos=${#repositories_array[@]}
+
+        if [[ ${num_repos} -eq 1 ]]; then
+            repo_name="${repositories_array[0]}"
+            log_info "Found one repository: ${repo_name}"
+        else
+            log_info "Found ${num_repos} repositories:"
+            for i in "${!repositories_array[@]}"; do
+                echo "  $((i+1)). ${repositories_array[i]}"
+            done
+            echo ""
+            read -rp "Select repository number (1-${num_repos}): " selection
+
+            if [[ ! "${selection}" =~ ^[0-9]+$ ]] || [[ ${selection} -lt 1 ]] || [[ ${selection} -gt ${num_repos} ]]; then
+                log_error "Invalid selection. Exiting."
+                exit 1
+            fi
+
+            repo_name="${repositories_array[$((selection-1))]}"
+            log_info "Selected repository: ${repo_name}"
+        fi
+
+        local repository_resource="projects/${PROJECT_ID}/locations/${REGION}/connections/${connection_name}/repositories/${repo_name}"
+
+        # Confirmation prompt
+        echo ""
+        log_info "About to create trigger with the following configuration:"
+        echo "  Trigger name: ${trigger_name}"
+        echo "  Connection: ${connection_name}"
+        echo "  Repository: ${repo_name}"
+        echo "  Branch pattern: ^main$"
+        echo "  Build config: cloudbuild.yaml"
+        echo "  Region: ${REGION}"
+        echo ""
+        read -rp "Proceed with trigger creation? (y/N): " confirm
+
+        if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
+            log_info "Trigger creation cancelled by user"
+            exit 0
+        fi
+
+        log_info "Creating GitHub trigger for ${repository_resource}"
+
+        # Create trigger with error handling
+        if gcloud builds triggers create github \
             --name="${trigger_name}" \
-            --repo-owner="${repo_owner}" \
-            --repo-name="${repo_name}" \
+            --repository="${repository_resource}" \
             --branch-pattern="^main$" \
             --build-config="cloudbuild.yaml" \
             --region="${REGION}" \
             --project="${PROJECT_ID}" \
-            --substitutions="_REGION=${REGION},_REPOSITORY=${REPOSITORY},_SERVICE_NAME=${SERVICE_NAME}"
-
-        log_success "Created GitHub trigger: ${trigger_name}"
+            --substitutions="_REGION=${REGION},_REPOSITORY=${REPOSITORY},_SERVICE_NAME=${SERVICE_NAME}" 2>&1 | tee -a "${LOG_FILE}"; then
+            log_success "Created GitHub trigger: ${trigger_name}"
+        else
+            local exit_code=$?
+            log_error "Failed to create trigger (exit code: ${exit_code})"
+            log_error ""
+            log_error "Common causes and solutions:"
+            log_error "  1. Repository not granted access to Cloud Build:"
+            log_error "     - Visit: https://console.cloud.google.com/cloud-build/repositories"
+            log_error "     - Ensure the repository is connected and has proper permissions"
+            log_error ""
+            log_error "  2. Insufficient IAM permissions:"
+            log_error "     - Required role: roles/cloudbuild.builds.editor or higher"
+            log_error "     - Visit: https://console.cloud.google.com/iam-admin/iam"
+            log_error ""
+            log_error "  3. Invalid region:"
+            log_error "     - Current region: ${REGION}"
+            log_error "     - Ensure the connection exists in this region"
+            log_error ""
+            log_error "  4. Connection or repository resource not found:"
+            log_error "     - Visit: https://console.cloud.google.com/cloud-build/connections"
+            log_error ""
+            log_error "See full error details in: ${LOG_FILE}"
+            exit 1
+        fi
     else
-        log_info "No GitHub connections found. Creating Cloud Source Repository trigger..."
-
-        # Use Cloud Source Repository
-        gcloud builds triggers create cloud-source-repositories \
-            --name="${trigger_name}" \
-            --repo="whatsapp-mcp" \
-            --branch-pattern="^main$" \
-            --build-config="cloudbuild.yaml" \
-            --region="${REGION}" \
-            --project="${PROJECT_ID}" \
-            --substitutions="_REGION=${REGION},_REPOSITORY=${REPOSITORY},_SERVICE_NAME=${SERVICE_NAME}"
-
-        log_success "Created Cloud Source Repository trigger: ${trigger_name}"
+        # No GitHub connections - error out instead of silently falling back to CSR
+        log_error "No GitHub App connections found."
+        log_error ""
+        log_error "A GitHub App connection is required to create triggers for GitHub-hosted repositories."
+        log_error "To fix this issue, choose one of the following options:"
+        log_error ""
+        log_error "  1. Create a GitHub App connection in the Cloud Build console:"
+        log_error "     https://console.cloud.google.com/cloud-build/connections"
+        log_error ""
+        log_error "  2. Use Cloud Source Repositories instead (after creating a CSR repo):"
+        log_error "     gcloud source repos create whatsapp-mcp"
+        log_error "     Then set USE_CSR=true and re-run this script"
+        log_error ""
+        log_error "  3. Skip trigger creation for now and set up manually later:"
+        log_error "     ${SCRIPT_NAME} --skip-trigger"
+        exit 1
     fi
 
     # Describe trigger to confirm
@@ -309,6 +542,9 @@ verify_deployment() {
 
 # Main setup function
 main() {
+    # Parse command line arguments first
+    parse_arguments "$@"
+
     echo "================================"
     echo "Cloud Build Setup for WhatsApp MCP"
     echo "================================"
@@ -330,13 +566,22 @@ main() {
     grant_cloudbuild_permissions
     echo ""
 
-    create_cloudbuild_trigger
-    echo ""
-
-    # Optional: test manual build
-    if test_manual_build; then
+    # Only call create_cloudbuild_trigger if not skipping
+    # (The function itself also checks SKIP_TRIGGER, but we control the call here too)
+    if [[ "${SKIP_TRIGGER}" != "true" ]]; then
+        create_cloudbuild_trigger
         echo ""
-        verify_deployment
+    else
+        log_info "Trigger creation skipped (--skip-trigger flag set)"
+        echo ""
+    fi
+
+    # Optional: test manual build (only if trigger was created)
+    if [[ "${SKIP_TRIGGER}" != "true" ]]; then
+        if test_manual_build; then
+            echo ""
+            verify_deployment
+        fi
     fi
 
     echo ""
@@ -345,18 +590,45 @@ main() {
     echo "================================"
     echo "Next Steps:"
     echo "================================"
-    echo "1. Push your code to the main branch to trigger a build"
-    echo "2. Monitor builds: gcloud builds list --project=${PROJECT_ID}"
-    echo "3. View build logs: gcloud builds log <BUILD_ID>"
-    echo "4. Check Cloud Run service: gcloud run services describe ${SERVICE_NAME} --region=${REGION}"
-    echo "5. View logs: ${LOG_FILE}"
+
+    if [[ "${SKIP_TRIGGER}" == "true" ]]; then
+        echo "Trigger creation was skipped. To create triggers later:"
+        echo ""
+        echo "Option 1: GitHub-hosted repository (recommended)"
+        echo "  1. Create a GitHub App connection:"
+        echo "     https://console.cloud.google.com/cloud-build/connections"
+        echo "  2. Connect your repository through the console"
+        echo "  3. Re-run this script without --skip-trigger flag:"
+        echo "     ${SCRIPT_NAME}"
+        echo ""
+        echo "Option 2: Cloud Source Repositories"
+        echo "  1. Create a Cloud Source Repository:"
+        echo "     gcloud source repos create whatsapp-mcp"
+        echo "  2. Set up repository mirroring or push your code to CSR"
+        echo "  3. Manually create the trigger through the console or gcloud CLI"
+        echo ""
+        echo "Option 3: Manual trigger creation"
+        echo "  Visit: https://console.cloud.google.com/cloud-build/triggers"
+        echo ""
+    else
+        echo "1. Push your code to the main branch to trigger a build"
+        echo "2. Monitor builds: gcloud builds list --project=${PROJECT_ID}"
+        echo "3. View build logs: gcloud builds log <BUILD_ID>"
+        echo "4. Check Cloud Run service: gcloud run services describe ${SERVICE_NAME} --region=${REGION}"
+    fi
+
     echo ""
-    echo "Manual build command:"
-    echo "  gcloud builds submit --config=cloudbuild.yaml --project=${PROJECT_ID}"
+    echo "Common commands:"
+    echo "  Manual build:"
+    echo "    gcloud builds submit --config=cloudbuild.yaml --project=${PROJECT_ID} --region=${REGION}"
     echo ""
-    echo "Manual verification command:"
-    echo "  curl \$(gcloud run services describe ${SERVICE_NAME} --region=${REGION} --format='value(status.url)')/health"
+    echo "  View logs: ${LOG_FILE}"
     echo ""
+    if [[ "${SKIP_TRIGGER}" != "true" ]]; then
+        echo "  Health check (after deployment):"
+        echo "    curl \$(gcloud run services describe ${SERVICE_NAME} --region=${REGION} --format='value(status.url)')/health"
+        echo ""
+    fi
 }
 
 # Run main function

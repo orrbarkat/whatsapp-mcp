@@ -1,5 +1,11 @@
 # Secrets and Environment Variables Reference
 
+**This is the authoritative source for all environment variables and secrets used in the WhatsApp MCP Server.**
+
+For templates and examples, see:
+- [.env.example](../.env.example) - Local development template
+- [gcp/env-template.yaml](gcp/env-template.yaml) - Cloud Run deployment template
+
 This document provides a comprehensive reference of all secrets and environment variables used in the WhatsApp MCP Server.
 
 ## Quick Reference Table

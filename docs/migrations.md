@@ -1,20 +1,8 @@
 # Database Migrations
 
-**For complete migration documentation, see [docs/migrations.md](../../docs/migrations.md)**
+This guide covers database schema migrations for the WhatsApp MCP server. These migrations are compatible with both PostgreSQL (including Supabase) and SQLite databases.
 
-This directory contains SQL migration scripts for the WhatsApp MCP database schema. These migrations are compatible with both PostgreSQL (including Supabase) and SQLite databases.
-
-Quick Links:
-- [How to Apply Migrations](../../docs/migrations.md#how-to-apply-migrations)
-- [Migration Order](../../docs/migrations.md#migration-order)
-- [Verification Steps](../../docs/migrations.md#verification)
-- [Database Configuration](../../docs/database.md)
-
-## Migration Order
-
-**IMPORTANT**: Migrations must be applied in numerical order. The base schema migration `000_create_bridge_tables.sql` must be applied first before any other migrations.
-
-## ⚠️ Critical: Migrations Are NOT Automatic
+## Critical: Migrations Are NOT Automatic
 
 **Migrations must be run manually BEFORE starting the application.** The WhatsApp bridge does NOT automatically apply migrations. If you attempt to start the bridge without first applying the required migrations, it will fail with an error about missing tables.
 
@@ -24,11 +12,14 @@ Quick Links:
 3. Apply subsequent migration files in numerical order
 4. Verify tables exist before starting the application
 
-See the "How to Apply Migrations" section below for detailed instructions.
+## Migration Order
+
+**IMPORTANT**: Migrations must be applied in numerical order. The base schema migration `000_create_bridge_tables.sql` must be applied first before any other migrations.
 
 ## Migration Files
 
 ### 000_create_bridge_tables.sql
+
 Creates the core `chats` and `messages` tables required by the WhatsApp bridge. This migration is **mandatory** and must be run before starting the bridge.
 
 **Purpose:** Establishes the base schema for storing chat metadata and message history.
@@ -42,6 +33,7 @@ Creates the core `chats` and `messages` tables required by the WhatsApp bridge. 
 **Requirement:** The WhatsApp bridge validates that these tables exist on startup and will fail if they are missing.
 
 ### 001_create_chat_list_view.sql
+
 Creates the `chat_list` view that aggregates chat information with the most recent message details. This view is used by the `SupabaseChatRepository.list_chats()` method to efficiently retrieve chat listings without relying on unsupported RPC chaining.
 
 **Purpose:** Resolves the issue where supabase-py does not support chaining `.select()`, `.or_()`, `.order()`, and `.range()` on RPC function results.
@@ -51,6 +43,7 @@ Creates the `chat_list` view that aggregates chat information with the most rece
 **Dependencies:** Requires `000_create_bridge_tables.sql` to be applied first.
 
 ### 010_create_whatsmeow_session_tables.sql
+
 Creates all tables required by `go.mau.fi/whatsmeow/store/sqlstore` for storing WhatsApp session data in Postgres. This migration is **required** when using Postgres (including Supabase) as the session store backend.
 
 **Purpose:** Establishes the schema for whatsmeow's SQLite-compatible tables adapted for Postgres. Enables storing WhatsApp device sessions, encryption keys, contacts, and sync state in a centralized database instead of local SQLite files.
@@ -256,3 +249,24 @@ DROP VIEW IF EXISTS chat_list;
 ```
 
 Note: The indexes created in the base migration (idx_chats_last_message_time, idx_messages_chat_timestamp) should not be dropped unless you're also rolling back the base migration, as they improve performance for other queries.
+
+### Rollback Session Tables (010_create_whatsmeow_session_tables.sql)
+
+**WARNING**: This will delete all WhatsApp session data, requiring re-authentication!
+
+```sql
+-- Drop all session tables
+DROP TABLE IF EXISTS privacy_tokens CASCADE;
+DROP TABLE IF EXISTS message_secrets CASCADE;
+DROP TABLE IF EXISTS chat_settings CASCADE;
+DROP TABLE IF EXISTS contacts CASCADE;
+DROP TABLE IF EXISTS app_state_mutation_macs CASCADE;
+DROP TABLE IF EXISTS app_state_version CASCADE;
+DROP TABLE IF EXISTS app_state_sync_keys CASCADE;
+DROP TABLE IF EXISTS sender_keys CASCADE;
+DROP TABLE IF EXISTS sessions CASCADE;
+DROP TABLE IF EXISTS signed_prekeys CASCADE;
+DROP TABLE IF EXISTS prekeys CASCADE;
+DROP TABLE IF EXISTS identities CASCADE;
+DROP TABLE IF EXISTS devices CASCADE;
+```
