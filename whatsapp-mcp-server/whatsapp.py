@@ -13,6 +13,7 @@ import threading
 import queue
 import psutil
 import signal
+import sys
 from models import Message, Chat, Contact, MessageContext, BridgeStatus
 from database_sqlite import SQLiteDatabaseAdapter
 
@@ -231,6 +232,15 @@ def start_bridge_process() -> Tuple[bool, str]:
             
             if BRIDGE_PROCESS.poll() is not None:
                 # Process exited, capture its return code
+                # Try to drain queue for any last messages
+                try:
+                    while True:
+                        line = BRIDGE_OUTPUT_QUEUE.get_nowait()
+                        print(f"Bridge final output: {line}")
+                        if "Required session table 'devices' does not exist" in line or "Bridge initialization failed" in line:
+                            error_message = line
+                except queue.Empty:
+                    pass
                 return False, f"Bridge process failed to start. Exit code: {BRIDGE_PROCESS.returncode}. Output: {error_message or 'No specific error message captured.'}"
             
             time.sleep(0.1) # Check more frequently
@@ -255,7 +265,8 @@ def stop_bridge_process() -> bool:
             # Try to signal the process group first
             try:
                 pgid = os.getpgid(pid)
-                print("Sending SIGTERM to bridge process group...", flush=True)
+                if not sys.stderr.closed:
+                    print("Sending SIGTERM to bridge process group...", file=sys.stderr, flush=True)
                 os.killpg(pgid, signal.SIGTERM)
             except Exception:
                 # Fallback to terminating the process directly
@@ -266,9 +277,11 @@ def stop_bridge_process() -> bool:
 
             try:
                 BRIDGE_PROCESS.wait(timeout=10)
-                print("Bridge process terminated gracefully", flush=True)
+                if not sys.stderr.closed:
+                    print("Bridge process terminated gracefully", file=sys.stderr, flush=True)
             except subprocess.TimeoutExpired:
-                print("Bridge did not exit in time; sending SIGKILL...", flush=True)
+                if not sys.stderr.closed:
+                    print("Bridge did not exit in time; sending SIGKILL...", file=sys.stderr, flush=True)
                 try:
                     os.killpg(os.getpgid(pid), signal.SIGKILL)
                 except Exception:
@@ -277,7 +290,8 @@ def stop_bridge_process() -> bool:
                     except Exception:
                         pass
         except Exception as e:
-            print(f"Error stopping bridge process: {e}", flush=True)
+            if not sys.stderr.closed:
+                print(f"Error stopping bridge process: {e}", file=sys.stderr, flush=True)
         finally:
             BRIDGE_PROCESS = None
 

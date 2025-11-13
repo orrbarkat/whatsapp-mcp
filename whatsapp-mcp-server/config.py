@@ -72,7 +72,7 @@ class DatabaseConfig:
                 with open(config_path, 'r') as f:
                     config_data = yaml.safe_load(f)
 
-                if config_data and 'database' in config_data:
+                if config_data and config_data.get('database') is not None:
                     logger.info("Loading database configuration from config.yaml")
                     return cls._from_yaml_config(config_data['database'])
             except Exception as e:

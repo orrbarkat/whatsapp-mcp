@@ -54,7 +54,7 @@ steps:
       # DATABASE_URL: Required only when using PostgreSQL/Supabase for session storage
       # For SQLite-only deployments, remove DATABASE_URL from the line below
       - '--update-secrets=GOOGLE_CLIENT_ID=whatsapp-mcp-google-client-id:latest,DATABASE_URL=whatsapp-mcp-database-url:latest'
-      - '--set-env-vars=MCP_TRANSPORT=sse,PORT=3000,MCP_PORT=3000,WHATSAPP_BRIDGE_URL=http://localhost:8080,GCS_SESSION_BUCKET=${_GCS_SESSION_BUCKET},GCS_SESSION_OBJECT_NAME=whatsapp.db,OAUTH_ENABLED=true,LOG_LEVEL=INFO'
+      - '--set-env-vars=MCP_TRANSPORT=sse,PORT=3000,MCP_PORT=3000,WHATSAPP_BRIDGE_URL=http://localhost:8080,DATABASE_URL=${_DATABASE_URL},OAUTH_ENABLED=true,LOG_LEVEL=INFO'
       - '--allow-unauthenticated'
       - '--min-instances=0'
       - '--max-instances=10'
