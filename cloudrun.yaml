@@ -66,7 +66,7 @@ spec:
         env:
         # MCP Transport Configuration
         - name: MCP_TRANSPORT
-          value: "sse"
+          value: "$(MCP_TRANSPORT)"
         - name: PORT
           value: "3000"
         - name: MCP_PORT
@@ -76,11 +76,11 @@ spec:
         - name: WHATSAPP_BRIDGE_URL
           value: "http://localhost:8080"
 
-        # GCS Session Storage Configuration
-        - name: GCS_SESSION_BUCKET
-          value: GCS_SESSION_BUCKET
-        - name: GCS_SESSION_OBJECT_NAME
-          value: GCS_SESSION_OBJECT_NAME
+        # # GCS Session Storage Configuration
+        # - name: GCS_SESSION_BUCKET
+        #   value: GCS_SESSION_BUCKET
+        # - name: GCS_SESSION_OBJECT_NAME
+        #   value: GCS_SESSION_OBJECT_NAME
 
         # OAuth Configuration
         - name: OAUTH_ENABLED
@@ -109,12 +109,11 @@ spec:
         #     secretKeyRef:
         #       name: whatsapp-mcp-supabase-key
         #       key: latest
-        # - name: DATABASE_URL
-        #   valueFrom:
-        #     secretKeyRef:
-        #       name: whatsapp-mcp-database-url
-        #       key: latest
-
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: whatsapp-mcp-session-dsn
+              key: latest
         # Optional: Separate session database (uncomment to use Supabase for sessions)
         # If not set, defaults to DATABASE_URL or local SQLite
         # - name: WHATSAPP_SESSION_DATABASE_URL
