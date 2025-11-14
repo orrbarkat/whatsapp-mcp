@@ -66,7 +66,7 @@ spec:
         env:
         # MCP Transport Configuration
         - name: MCP_TRANSPORT
-          value: "$(MCP_TRANSPORT)"
+          value: "sse"
         - name: PORT
           value: "3000"
         - name: MCP_PORT
@@ -149,8 +149,8 @@ spec:
           failureThreshold: 3
 
       # Scaling configuration
-      minScale: 0
-      maxScale: 10
+      minScale: 1
+      maxScale: 1
 
   traffic:
   - percent: 100
